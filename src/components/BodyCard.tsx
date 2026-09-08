@@ -11,6 +11,7 @@ export interface BodySnapshot {
   distToSun: number;
   energy: number;
   isStar?: boolean;
+  isBlackHole?: boolean;
   userLaunched?: boolean;
   age: number;
   period: number | null;
@@ -40,12 +41,16 @@ export default function BodyCard({ body, following, onFollow, onDelete, onScaleM
         <div className="flex items-center gap-2">
           <span
             className="inline-block h-4 w-4 rounded-full"
-            style={{ background: body.color, boxShadow: body.isStar ? `0 0 10px ${body.color}` : undefined }}
+            style={{
+              background: body.isBlackHole ? '#000000' : body.color,
+              border: body.isBlackHole ? `2px solid ${body.color}` : undefined,
+              boxShadow: body.isStar || body.isBlackHole ? `0 0 10px ${body.color}` : undefined,
+            }}
           />
           <div>
             <div className="text-sm font-semibold text-white">{body.name}</div>
             <div className="text-[10px] text-slate-400">
-              {body.isStar ? '恒星' : body.mass > 1e-4 ? '巨行星' : body.mass > 1e-8 ? '行星' : '小天体'}
+              {body.isBlackHole ? '黑洞' : body.isStar ? '恒星' : body.mass > 1e-4 ? '巨行星' : body.mass > 1e-8 ? '行星' : '小天体'}
               {body.userLaunched ? ' · 玩家发射' : ''}
             </div>
           </div>

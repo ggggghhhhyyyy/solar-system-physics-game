@@ -4,14 +4,23 @@ import ControlPanel from './components/ControlPanel';
 import BodyCard, { type BodySnapshot } from './components/BodyCard';
 import { Btn, Panel, formatTime } from './components/ui';
 import { Engine } from './physics/engine';
-import { PRESETS, asteroidShower, generateRandomSystem, longPeriodComet, rogueStar } from './physics/presets';
-import { MissionTracker, type MissionState } from './game/missions';
+import { PRESETS, asteroidShower, generateRandomSystem, longPeriodComet, rogueBlackHole, rogueStar } from './physics/presets';
+import { MissionTracker, type MissionDef, type MissionState } from './game/missions';
+import {
+  getDailyMissions,
+  loadDailyState,
+  rerollMission,
+  saveDailyState,
+  todayKey,
+} from './game/dailyMissions';
+import { MissionCelebration } from './components/MissionCelebration';
 import { DEFAULT_SETTINGS, SPEED_STEPS, type Settings } from './game/settings';
 import type { Body } from './physics/types';
 import { exportSnapshot, parseSnapshot, restoreSnapshot, serializeSnapshot } from './physics/snapshot';
 import {
   ACHIEVEMENTS,
   loadStats,
+  recordDailyAllDone,
   recordEvents,
   recordLaunch,
   recordMissionDone,
@@ -33,7 +42,22 @@ export default function App() {
     e.reset(PRESETS[0].bodies.map((b) => ({ ...b })));
     return e;
   }, []);
-  const tracker = useMemo(() => new MissionTracker(), []);
+  const [dailyDate, setDailyDate] = useState(() => todayKey());
+  const [dailyDefs, setDailyDefs] = useState<MissionDef[]>(() => {
+    const keys = new Set<string>();
+    for (const b of PRESETS[0].bodies) if (b.key) keys.add(b.key);
+    return getDailyMissions(todayKey(), [...keys]);
+  });
+  const [rerollsLeft, setRerollsLeft] = useState(() => loadDailyState(todayKey()).rerollsLeft);
+  const [celebration, setCelebration] = useState<MissionState | null>(null);
+  const [onboardStep, setOnboardStep] = useState<number | null>(() => {
+    try {
+      return localStorage.getItem('ssp1-onboarded') === '1' ? null : 0;
+    } catch {
+      return 0;
+    }
+  });
+  const tracker = useMemo(() => new MissionTracker(dailyDefs), []);
   const canvasRef = useRef<CanvasHandle>(null);
 
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
@@ -47,9 +71,13 @@ export default function App() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [panelOpen, setPanelOpen] = useState(true);
   const [showHelp, setShowHelp] = useState(true);
-  const prevDoneRef = useRef<Set<string>>(new Set());
+  const prevDoneRef = useRef<Set<string>>(new Set(loadDailyState(todayKey()).doneIds));
   const [stats, setStats] = useState<Stats>(() => loadStats());
   const prevTimeRef = useRef<number>(engine.time);
+  const dailyDateRef = useRef(dailyDate);
+  dailyDateRef.current = dailyDate;
+  const dailyDefsRef = useRef(dailyDefs);
+  dailyDefsRef.current = dailyDefs;
 
   const update = useCallback((patch: Partial<Settings>) => {
     setSettings((s) => ({ ...s, ...patch }));
@@ -82,7 +110,10 @@ export default function App() {
             const important = e.survivor.mass > 1e-8 && e.absorbed.mass > 1e-8;
             const involvesUser = e.survivor.userLaunched || e.absorbed.userLaunched;
             if (important || involvesUser || e.absorbed.key) {
-              pushLog(`${e.survivor.name} 吞噬了 ${e.absorbed.name}`, important ? 'warn' : 'info');
+              pushLog(
+                e.survivor.isBlackHole ? `🕳 黑洞吞噬了 ${e.absorbed.name}` : `${e.survivor.name} 吞噬了 ${e.absorbed.name}`,
+                important ? 'warn' : 'info',
+              );
             }
           } else if (e.type === 'escaped' && e.body) {
             if (e.body.mass > 1e-8 || e.body.userLaunched) {
@@ -92,11 +123,47 @@ export default function App() {
         }
       }
       const ms = tracker.update(engine);
+      // 跨天检查：日期变化则抽新一日任务
+      const today = todayKey();
+      if (today !== dailyDateRef.current) {
+        const keys = new Set<string>();
+        for (const b of engine.bodies) if (b.key) keys.add(b.key);
+        const next = getDailyMissions(today, [...keys]);
+        tracker.setDefs(next);
+        dailyDefsRef.current = next;
+        setDailyDefs(next);
+        setDailyDate(today);
+        prevDoneRef.current.clear();
+        const st = loadDailyState(today);
+        for (const id of st.doneIds) prevDoneRef.current.add(id);
+        setRerollsLeft(st.rerollsLeft);
+        setMissions(tracker.update(engine));
+        pushLog(`📅 新的一天，今日太空任务已刷新！`, 'success');
+        return;
+      }
       for (const m of ms) {
         if (m.done && !prevDoneRef.current.has(m.id)) {
           prevDoneRef.current.add(m.id);
-          recordMissionDone(m.id);
-          pushLog(`任务完成：${m.title}`, 'success');
+          const date = dailyDateRef.current;
+          recordMissionDone(m.id, date);
+          // 同步每日存档
+          try {
+            const st = loadDailyState(date);
+            if (!st.doneIds.includes(m.id)) {
+              const stars = (m.stars ?? 1);
+              const nextSt = { doneIds: [...st.doneIds, m.id], rerollsLeft: st.rerollsLeft, stars: st.stars + stars };
+              saveDailyState(date, nextSt);
+            }
+          } catch { /* 忽略 */ }
+          pushLog(`任务完成：${m.title} +${m.stars ?? 1}★`, 'success');
+          setCelebration(m);
+          // 当日全部完成
+          const allDone = dailyDefsRef.current.length > 0 &&
+            dailyDefsRef.current.every((d) => prevDoneRef.current.has(d.id));
+          if (allDone) {
+            recordDailyAllDone(date);
+            pushLog(`🎉 今日太空任务全部完成！你是小小宇航员！`, 'success');
+          }
         }
       }
       setMissions(ms);
@@ -167,6 +234,7 @@ export default function App() {
             distToSun,
             energy,
             isStar: sel.isStar,
+            isBlackHole: sel.isBlackHole,
             userLaunched: sel.userLaunched,
             age: engine.time - sel.createdAt,
             period,
@@ -190,20 +258,54 @@ export default function App() {
         : PRESETS.find((x) => x.id === id);
       if (!p) return;
       engine.dt = p.dt ?? 0.0002;
+      engine.softening = p.softening ?? 0.003;
       engine.reset(p.bodies.map((b) => ({ ...b })));
-      tracker.reset();
-      prevDoneRef.current.clear();
+      // 每日任务：只清进度不清完成，切场景不丢星星
+      tracker.softReset();
       setPresetId(id);
       setSelected(null);
       update({ selectedId: null, followId: null });
       canvasRef.current?.setView({ x: 0, y: 0 }, p.viewRadius);
       pushLog(`已加载场景：${p.name}`);
+      setMissions(tracker.update(engine));
     },
     [engine, tracker, update, pushLog],
   );
 
+  const handleReroll = useCallback(() => {
+    const date = dailyDateRef.current;
+    const st = loadDailyState(date);
+    if (st.rerollsLeft <= 0) {
+      pushLog('换一换次数用完啦，明天再来！', 'warn');
+      return;
+    }
+    const keys = new Set<string>();
+    for (const b of engine.bodies) if (b.key) keys.add(b.key);
+    const scenarioKeys = [...keys];
+    // 找第一个未完成的槽位换掉，已全完成则换第0个
+    const defs = dailyDefsRef.current;
+    let idx = defs.findIndex((d) => !prevDoneRef.current.has(d.id));
+    if (idx < 0) idx = 0;
+    const exclude = [...prevDoneRef.current, ...defs.map((d) => d.id)];
+    try {
+      const next = rerollMission(date, idx, scenarioKeys, exclude);
+      const newDefs = [...defs];
+      newDefs[idx] = next;
+      tracker.setDefs(newDefs, { preserveDone: true });
+      dailyDefsRef.current = newDefs;
+      setDailyDefs(newDefs);
+      const left = st.rerollsLeft - 1;
+      setRerollsLeft(left);
+      saveDailyState(date, { ...st, rerollsLeft: left });
+      setMissions(tracker.update(engine));
+      pushLog(`已换一个新任务：${next.title}`, 'success');
+    } catch {
+      pushLog('换任务失败', 'warn');
+    }
+  }, [engine, tracker, pushLog]);
+
   const handleEvent = useCallback(
-    (kind: 'rogue' | 'shower' | 'comet' | 'clearUser' | 'clearTrails') => {
+    (kind: 'rogue' | 'rogueBH' | 'shower' | 'comet' | 'clearUser' | 'clearTrails') => {
       const sun = engine.heaviest();
       const c = sun ? { x: sun.x, y: sun.y } : { x: 0, y: 0 };
       switch (kind) {
@@ -211,6 +313,11 @@ export default function App() {
           engine.addBody(rogueStar(c));
           tracker.onRogueSpawned(engine);
           pushLog('⚠️ 一颗流浪恒星正在逼近！', 'warn');
+          break;
+        }
+        case 'rogueBH': {
+          engine.addBody(rogueBlackHole(c));
+          pushLog('🕳 一个流浪黑洞正在逼近！引力场即将被撕扯！', 'warn');
           break;
         }
         case 'shower': {
@@ -269,8 +376,7 @@ export default function App() {
         return;
       }
       restoreSnapshot(engine, data);
-      tracker.reset();
-      prevDoneRef.current.clear();
+      tracker.softReset();
       prevTimeRef.current = engine.time;
       setMissions(tracker.update(engine));
       setSimTime(engine.time);
@@ -410,8 +516,60 @@ export default function App() {
           onLoad={onLoad}
           onClear={onClear}
           achievements={achievements}
+          dailyDate={dailyDate}
+          rerollsLeft={rerollsLeft}
+          onReroll={handleReroll}
         />
       </div>
+
+      {/* 任务完成庆祝 */}
+      {celebration && (
+        <MissionCelebration
+          mission={{
+            title: celebration.title,
+            emoji: celebration.emoji,
+            fact: celebration.fact ?? '你又离成为小小宇航员近了一步！',
+            stars: celebration.stars ?? 1,
+          }}
+          onClose={() => setCelebration(null)}
+        />
+      )}
+
+      {/* 新手引导 */}
+      {onboardStep !== null && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/70 p-4">
+          <Panel className="w-full max-w-sm px-4 py-3">
+            <div className="text-sm font-bold text-white">新手引导 {onboardStep + 1}/3</div>
+            <div className="mt-1 text-xs leading-relaxed text-slate-300">
+              {onboardStep === 0 && '🚀 第1步：发射天体 — 在画布上按住拖动，松开发射！箭头越长飞得越快。'}
+              {onboardStep === 1 && '📅 第2步：做今日任务 — 右侧查看今日3个太空任务，不喜欢可点换一换。'}
+              {onboardStep === 2 && '⏯ 第3步：操控时间 — 顶部暂停/加速（空格），滚轮缩放，双击天体可跟随哦！'}
+            </div>
+            <div className="mt-3 flex justify-between">
+              <Btn
+                onClick={() => {
+                  try { localStorage.setItem('ssp1-onboarded', '1'); } catch { /* 忽略 */ }
+                  setOnboardStep(null);
+                }}
+              >
+                跳过
+              </Btn>
+              <Btn
+                onClick={() => {
+                  if (onboardStep >= 2) {
+                    try { localStorage.setItem('ssp1-onboarded', '1'); } catch { /* 忽略 */ }
+                    setOnboardStep(null);
+                  } else {
+                    setOnboardStep(onboardStep + 1);
+                  }
+                }}
+              >
+                {onboardStep === 2 ? '出发！' : '下一步'}
+              </Btn>
+            </div>
+          </Panel>
+        </div>
+      )}
 
       {/* Bottom-left: body card + logs + help */}
       <div className="pointer-events-none absolute bottom-3 left-3 flex flex-col items-start gap-2">
@@ -428,6 +586,8 @@ export default function App() {
               <li>滚轮 / 双指缩放；Shift+拖动 或 右键拖动 平移</li>
               <li>单击选中天体，双击跟随；F 切换跟随</li>
               <li>空格 暂停；+/- 缩放；Delete 删除选中天体</li>
+              <li>◆ L1–L5 为拉格朗日点标记（随「显示名称」开关）</li>
+              <li>🕳 可发射黑洞，或用事件召唤流浪黑洞；双击黑洞可跟随观察吸积</li>
               <li>完成右侧任务，或制造你自己的星系灾难</li>
             </ul>
           </Panel>

@@ -9,8 +9,12 @@ export const circularSpeed = (M: number, r: number): number => Math.sqrt((G0 * M
 interface PlanetOpts {
   key?: string;
   isStar?: boolean;
+  isBlackHole?: boolean;
+  /** 碎块/气流粒子:互相之间不合并,但仍可撞击行星或被黑洞吸积 */
+  noCollide?: boolean;
   ring?: boolean;
   ecc?: number; // speed multiplier for slight eccentricity
+  retro?: boolean; // 逆行轨道(如海卫一 Triton)
 }
 
 /** Create a body on a (near) circular orbit around a central mass M at origin. */
@@ -26,7 +30,7 @@ export function orbiting(
   center: { x: number; y: number; vx: number; vy: number } = { x: 0, y: 0, vx: 0, vy: 0 },
 ): BodySpec {
   const th = (angleDeg * Math.PI) / 180;
-  const v = circularSpeed(M, a) * (opts.ecc ?? 1);
+  const v = circularSpeed(M, a) * (opts.ecc ?? 1) * (opts.retro ? -1 : 1);
   return {
     name,
     key: opts.key,
@@ -38,6 +42,8 @@ export function orbiting(
     vx: center.vx - v * Math.sin(th),
     vy: center.vy + v * Math.cos(th),
     isStar: opts.isStar,
+    isBlackHole: opts.isBlackHole,
+    noCollide: opts.noCollide,
     ring: opts.ring,
   };
 }
@@ -91,7 +97,7 @@ function asteroidBelt(count: number, rMin: number, rMax: number, seed = 7): Body
     const ecc = 0.96 + rnd() * 0.08;
     const g = 120 + Math.floor(rnd() * 60);
     out.push(
-      orbiting(`小行星-${i + 1}`, a, 1e-12, 0.004, `rgb(${g},${g - 10},${g - 25})`, deg, 1, { ecc }),
+      orbiting(`小行星-${i + 1}`, a, 1e-12, 0.003, `rgb(${g},${g - 10},${g - 25})`, deg, 1, { ecc, noCollide: true }),
     );
   }
   return out;
@@ -111,7 +117,141 @@ function kuiperBelt(count: number, rMin: number, rMax: number, seed = 21): BodyS
     const ecc = 0.96 + rnd() * 0.08;
     const g = 130 + Math.floor(rnd() * 50);
     out.push(
-      orbiting(`柯伊伯-${i + 1}`, a, 1e-12, 0.004, `rgb(${g - 25},${g},${g + 25})`, deg, 1, { ecc }),
+      orbiting(`柯伊伯-${i + 1}`, a, 1e-12, 0.003, `rgb(${g - 25},${g},${g + 25})`, deg, 1, { ecc, noCollide: true }),
+    );
+  }
+  return out;
+}
+
+interface MoonDef {
+  name: string;
+  key?: string;
+  a: number; // AU,相对行星
+  mass: number; // 太阳质量
+  radius: number; // AU(显示/碰撞,经放大以便观察)
+  color: string;
+  angle: number;
+  retro?: boolean;
+  ecc?: number;
+}
+
+/**
+ * 给已定轨的行星挂卫星:位置=行星位置+相对偏移,速度=行星速度+绕行星圆轨道速度。
+ * 注意:行星显示半径必须小于卫星轨道(否则出生即碰撞),且轨道应在希尔球 ~0.4 倍以内才长期稳定。
+ */
+function moonsOf(planet: BodySpec, defs: MoonDef[]): BodySpec[] {
+  const center = { x: planet.x, y: planet.y, vx: planet.vx, vy: planet.vy };
+  return defs.map((m) =>
+    orbiting(m.name, m.a, m.mass, m.radius, m.color, m.angle, planet.mass, {
+      key: m.key,
+      ecc: m.ecc,
+      retro: m.retro,
+    }, center),
+  );
+}
+
+/** 内圈小行星群(祝融区/近水星区概念,0.09~0.2 AU),展示内圈拓展。 */
+function innerSwarm(count: number, rMin: number, rMax: number, seed = 41): BodySpec[] {
+  let s = seed;
+  const rnd = () => {
+    s = (s * 1664525 + 1013904223) % 4294967296;
+    return s / 4294967296;
+  };
+  const out: BodySpec[] = [];
+  for (let i = 0; i < count; i++) {
+    const a = rMin + (rMax - rMin) * rnd();
+    const deg = rnd() * 360;
+    const ecc = 0.96 + rnd() * 0.08;
+    const g = 150 + Math.floor(rnd() * 50);
+    out.push(
+      orbiting(`内圈小行星-${i + 1}`, a, 1e-12, 0.0015, `rgb(${g},${g - 20},${g - 60})`, deg, 1, { ecc, noCollide: true }),
+    );
+  }
+  return out;
+}
+
+/** 近地小行星群(0.7~1.5 AU)。 */
+function nearEarthSwarm(count: number, seed = 53): BodySpec[] {
+  let s = seed;
+  const rnd = () => {
+    s = (s * 1664525 + 1013904223) % 4294967296;
+    return s / 4294967296;
+  };
+  const out: BodySpec[] = [];
+  for (let i = 0; i < count; i++) {
+    const a = 0.7 + (1.5 - 0.7) * rnd();
+    const deg = rnd() * 360;
+    const ecc = 0.9 + rnd() * 0.2;
+    out.push(
+      orbiting(`近地小行星-${i + 1}`, a, 1e-12, 0.0015, '#d6c9a8', deg, 1, { ecc, noCollide: true }),
+    );
+  }
+  return out;
+}
+
+/** 木星特洛伊群:与木星同轨道、前后各 60°(L4/L5)附近。 */
+function trojans(jupiterAngleDeg: number, jupiterA: number, countPerCamp: number, seed = 77): BodySpec[] {
+  let s = seed;
+  const rnd = () => {
+    s = (s * 1664525 + 1013904223) % 4294967296;
+    return s / 4294967296;
+  };
+  const out: BodySpec[] = [];
+  for (let c = 0; c < 2; c++) {
+    const camp = c === 0 ? '希腊营' : '特洛伊营';
+    const base = jupiterAngleDeg + (c === 0 ? 60 : -60);
+    for (let i = 0; i < countPerCamp; i++) {
+      const a = jupiterA * (0.985 + rnd() * 0.03);
+      const deg = base + (rnd() - 0.5) * 28;
+      const ecc = 0.96 + rnd() * 0.08;
+      const g = 140 + Math.floor(rnd() * 50);
+      out.push(
+        orbiting(`特洛伊-${camp}-${i + 1}`, a, 1e-12, 0.0025, `rgb(${g},${g - 15},${g - 40})`, deg, 1, { ecc, noCollide: true }),
+      );
+    }
+  }
+  return out;
+}
+
+/* ---------- 黑洞 ---------- */
+
+export const BLACK_HOLE_LAUNCH_MASS = 4;
+
+function blackHole(
+  name: string,
+  mass: number,
+  radius: number,
+  x: number, y: number, vx: number, vy: number,
+  key?: string,
+): BodySpec {
+  return {
+    name, key, mass, radius, x, y, vx, vy,
+    color: '#a78bfa',
+    isBlackHole: true,
+  };
+}
+
+/** 吸积盘粒子:绕黑洞质量 M 的暖色小颗粒,内密外疏。 */
+function accretionDisk(
+  M: number,
+  center: { x: number; y: number; vx: number; vy: number },
+  count: number, rMin: number, rMax: number, seed = 99,
+): BodySpec[] {
+  let s = seed;
+  const rnd = () => {
+    s = (s * 1664525 + 1013904223) % 4294967296;
+    return s / 4294967296;
+  };
+  const palette = ['#fef3c7', '#fde68a', '#fbbf24', '#fb923c', '#f97316'];
+  const out: BodySpec[] = [];
+  for (let i = 0; i < count; i++) {
+    // 内密外疏:平方根分布偏向内圈
+    const f = Math.sqrt(rnd());
+    const a = rMin + (rMax - rMin) * f;
+    const deg = rnd() * 360;
+    const ecc = 0.99 + rnd() * 0.02;
+    out.push(
+      orbiting(`吸积流-${i + 1}`, a, 1e-13, 0.0012, palette[Math.floor(rnd() * palette.length)], deg, M, { ecc, noCollide: true }, center),
     );
   }
   return out;
@@ -128,6 +268,77 @@ export const PRESETS: Preset[] = [
       PLANETS.mercury(), PLANETS.venus(), PLANETS.earth(), PLANETS.mars(),
       PLANETS.jupiter(), PLANETS.saturn(), PLANETS.uranus(), PLANETS.neptune(),
     ]),
+  },
+  {
+    id: 'grand',
+    name: '完整太阳系 · 内圈+外圈',
+    description: '八大行星+20 颗卫星+内圈/近地/小行星带/特洛伊/柯伊伯带,行星半径经压缩以容纳卫星',
+    viewRadius: 60,
+    dt: 0.0002,
+    softening: 0.00015,
+    bodies: (() => {
+      // 行星半径经压缩(相对 PLANETS 缩小),保证卫星轨道不与行星碰撞且位于希尔球内
+      const mercury = orbiting('水星', 0.387, 1.66e-7, 0.0004, '#b8b0a6', 40, 1, { key: 'mercury' });
+      const venus = orbiting('金星', 0.723, 2.45e-6, 0.0008, '#e8c27a', 130, 1, { key: 'venus' });
+      const earth = orbiting('地球', 1.0, 3.0e-6, 0.0008, '#4f9de8', 0, 1, { key: 'earth' });
+      const mars = orbiting('火星', 1.524, 3.2e-7, 0.0004, '#e0684a', 250, 1, { key: 'mars' });
+      const jupiter = orbiting('木星', 5.203, 9.55e-4, 0.004, '#d9a066', 300, 1, { key: 'jupiter' });
+      const saturn = orbiting('土星', 9.537, 2.86e-4, 0.0034, '#e6d3a3', 200, 1, { key: 'saturn', ring: true });
+      const uranus = orbiting('天王星', 19.19, 4.37e-5, 0.0018, '#9fe0e8', 80, 1, { key: 'uranus' });
+      const neptune = orbiting('海王星', 30.07, 5.15e-5, 0.0017, '#4b6fe0', 160, 1, { key: 'neptune' });
+      const pluto = orbiting('冥王星', 39.5, 6.5e-9, 0.00009, '#c9b8a8', 10, 1, { key: 'pluto', ecc: 0.85 });
+      const moons: BodySpec[] = [
+        ...moonsOf(earth, [
+          { name: '月球', key: 'moon', a: 0.0028, mass: 3.69e-8, radius: 0.00014, color: '#d9d9d9', angle: 60 },
+        ]),
+        ...moonsOf(mars, [
+          { name: '火卫一·福波斯', key: 'phobos', a: 0.0008, mass: 1e-12, radius: 0.00006, color: '#a89f91', angle: 10 },
+          { name: '火卫二·戴莫斯', key: 'deimos', a: 0.0013, mass: 1e-12, radius: 0.00005, color: '#8d8578', angle: 190 },
+        ]),
+        ...moonsOf(jupiter, [
+          { name: '木卫一·伊奥', key: 'io', a: 0.0058, mass: 4.5e-8, radius: 0.00015, color: '#e8d27a', angle: 20 },
+          { name: '木卫二·欧罗巴', key: 'europa', a: 0.0092, mass: 2.4e-8, radius: 0.00013, color: '#d7e8f5', angle: 140 },
+          { name: '木卫三·盖尼米得', key: 'ganymede', a: 0.0145, mass: 7.4e-8, radius: 0.0002, color: '#a89f91', angle: 260 },
+          { name: '木卫四·卡利斯托', key: 'callisto', a: 0.025, mass: 5.4e-8, radius: 0.00019, color: '#7d7468', angle: 60 },
+        ]),
+        ...moonsOf(saturn, [
+          { name: '土卫一·弥玛斯', key: 'mimas', a: 0.0042, mass: 1e-12, radius: 0.00006, color: '#cfc8bb', angle: 30 },
+          { name: '土卫二·恩克拉多斯', key: 'enceladus', a: 0.0054, mass: 5.4e-11, radius: 0.00005, color: '#eef6ff', angle: 120 },
+          { name: '土卫三·特堤斯', key: 'tethys', a: 0.0067, mass: 3.1e-10, radius: 0.00006, color: '#d8d4c8', angle: 210 },
+          { name: '土卫四·狄俄涅', key: 'dione', a: 0.0086, mass: 5.5e-10, radius: 0.00007, color: '#c4beb0', angle: 300 },
+          { name: '土卫五·瑞亚', key: 'rhea', a: 0.012, mass: 1.16e-9, radius: 0.00008, color: '#b5aea0', angle: 80 },
+          { name: '土卫六·泰坦', key: 'titan', a: 0.0165, mass: 6.75e-8, radius: 0.0002, color: '#e0a458', angle: 180 },
+        ]),
+        ...moonsOf(uranus, [
+          { name: '天卫一·艾瑞尔', key: 'ariel', a: 0.0043, mass: 6.8e-10, radius: 0.00007, color: '#cfd6d4', angle: 45 },
+          { name: '天卫三·乌姆布里尔', key: 'umbriel', a: 0.006, mass: 6e-10, radius: 0.00007, color: '#9aa0a0', angle: 165 },
+          { name: '天卫四·泰坦尼亚', key: 'titania', a: 0.0098, mass: 1.77e-9, radius: 0.00009, color: '#c9c2b4', angle: 285 },
+          { name: '天卫五·奥伯龙', key: 'oberon', a: 0.013, mass: 1.52e-9, radius: 0.00009, color: '#b0a89a', angle: 105 },
+        ]),
+        ...moonsOf(neptune, [
+          // 海卫一为逆行大卫星
+          { name: '海卫一·特里同', key: 'triton', a: 0.0026, mass: 1.07e-8, radius: 0.00014, color: '#e8f0f2', angle: 200, retro: true },
+          { name: '海卫八·普罗透斯', key: 'proteus', a: 0.002, mass: 2.5e-11, radius: 0.00005, color: '#8f8b82', angle: 20 },
+        ]),
+        ...moonsOf(pluto, [
+          { name: '冥卫一·卡戎', key: 'charon', a: 0.0006, mass: 7.9e-10, radius: 0.00007, color: '#b9b0a4', angle: 90 },
+        ]),
+      ];
+      return balance([
+        { ...SUN },
+        mercury, venus, earth, mars, jupiter, saturn, uranus, neptune,
+        pluto,
+        orbiting('阋神星', 45, 8e-9, 0.00008, '#e8e4da', 250, 1, { key: 'eris', ecc: 1.1 }),
+        orbiting('妊神星', 43.1, 2e-9, 0.00008, '#dfe9ec', 320, 1, { key: 'haumea', ecc: 0.95 }),
+        orbiting('鸟神星', 45.5, 1.5e-9, 0.00007, '#d9c8b8', 140, 1, { key: 'makemake' }),
+        ...moons,
+        ...innerSwarm(14, 0.09, 0.2),
+        ...nearEarthSwarm(24),
+        ...asteroidBelt(170, 2.06, 3.27),
+        ...trojans(300, 5.203, 18),
+        ...kuiperBelt(130, 30, 50),
+      ]);
+    })(),
   },
   {
     id: 'belt',
@@ -229,6 +440,29 @@ export const PRESETS: Preset[] = [
       orbiting('TRAPPIST-1 g', 0.204, 2.6e-6, 0.0065, '#d9a066', 330, 0.09),
       orbiting('TRAPPIST-1 h', 0.269, 1e-6, 0.004, '#9fe0e8', 190, 0.09),
     ]),
+  },
+  {
+    id: 'blackhole',
+    name: '黑洞 · 潮汐吸积',
+    description: '12 倍太阳质量黑洞+吸积盘+3 颗伴星,看恒星如何被撕裂吞噬',
+    viewRadius: 8,
+    dt: 0.0002,
+    softening: 0.001,
+    bodies: (() => {
+      const M = 12;
+      const center = { x: 0, y: 0, vx: 0, vy: 0 };
+      const bodies: BodySpec[] = [
+        blackHole('黑洞 · 恒星级', M, 0.05, 0, 0, 0, 0, 'blackhole'),
+        // 伴星取小质量、宽间距(大质量密排会在几个轨道内互相散射)
+        orbiting('伴星 S1', 3.0, 0.5, 0.055, '#ffd27a', 20, M, { key: 's1', isStar: true }, center),
+        orbiting('伴星 S2', 5.5, 0.3, 0.045, '#8fd3ff', 200, M, { key: 's2', isStar: true }, center),
+        orbiting('伴星 S3', 9.0, 0.2, 0.04, '#ff9d7a', 110, M, { key: 's3', isStar: true }, center),
+        // 一颗俯冲恒星:远心点出发、近日点直插黑洞视界,演示潮汐吞噬(开场即上演)
+        orbiting('遇难恒星', 1.2, 0.4, 0.05, '#fff59d', 300, M, { key: 'doomed', isStar: true, ecc: 0.25 }, center),
+        ...accretionDisk(M, center, 150, 0.16, 0.95),
+      ];
+      return balance(bodies, 0);
+    })(),
   },
 ];
 
@@ -333,6 +567,7 @@ export interface LaunchType {
   radius: number;
   color: string;
   isStar?: boolean;
+  isBlackHole?: boolean;
 }
 
 export const LAUNCH_TYPES: LaunchType[] = [
@@ -342,6 +577,7 @@ export const LAUNCH_TYPES: LaunchType[] = [
   { id: 'giant', name: '气态巨行星', mass: 1e-3, radius: 0.05, color: '#f0a06a' },
   { id: 'dwarf', name: '红矮星', mass: 0.15, radius: 0.06, color: '#ff7a5c', isStar: true },
   { id: 'star', name: '恒星', mass: 1, radius: 0.09, color: '#ffe082', isStar: true },
+  { id: 'blackhole', name: '黑洞', mass: BLACK_HOLE_LAUNCH_MASS, radius: 0.035, color: '#a78bfa', isBlackHole: true },
 ];
 
 /* ---------- Spawnable events ---------- */
@@ -372,6 +608,22 @@ export function rogueStar(center: { x: number; y: number }): BodySpec {
     color: '#ff6b6b',
     isStar: true,
   };
+}
+
+export function rogueBlackHole(center: { x: number; y: number }): BodySpec {
+  eventCounter++;
+  const ang = Math.random() * TWO_PI;
+  const dist = 30;
+  const x = center.x + Math.cos(ang) * dist;
+  const y = center.y + Math.sin(ang) * dist;
+  const offset = (Math.random() - 0.5) * 4;
+  const tx = center.x + Math.cos(ang + Math.PI / 2) * offset;
+  const ty = center.y + Math.sin(ang + Math.PI / 2) * offset;
+  const dx = tx - x;
+  const dy = ty - y;
+  const len = Math.hypot(dx, dy);
+  const speed = 6;
+  return blackHole(`流浪黑洞-${eventCounter}`, BLACK_HOLE_LAUNCH_MASS, 0.035, x, y, (dx / len) * speed, (dy / len) * speed);
 }
 
 export function asteroidShower(center: { x: number; y: number }, count = 25): BodySpec[] {

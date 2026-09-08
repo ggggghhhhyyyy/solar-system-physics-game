@@ -138,7 +138,9 @@ export class Engine {
       vx: spec.vx,
       vy: spec.vy,
       color: spec.color,
-      isStar: !!spec.isStar,
+      isStar: !!spec.isStar && !spec.isBlackHole,
+      isBlackHole: !!spec.isBlackHole,
+      noCollide: !!spec.noCollide,
       ring: !!spec.ring,
       userLaunched: !!spec.userLaunched,
       fixed: !!spec.fixed,
@@ -446,7 +448,10 @@ export class Engine {
       }
       outer: for (let i = 0; i < n; i++) {
         const xi = xs[i], yi = ys[i], ri = rs[i];
+        // 两个 noCollide 天体之间跳过合并(碎块/气流互穿),其余组合正常检查
+        const iNC = bs[i].noCollide;
         for (let j = i + 1; j < n; j++) {
+          if (iNC && bs[j].noCollide) continue;
           const dx = xi - xs[j];
           const dy = yi - ys[j];
           const rr = ri + rs[j];
@@ -519,6 +524,7 @@ export class Engine {
           const j = cand[k];
           if (j === prev) continue;
           prev = j;
+          if (bs[i].noCollide && bs[j].noCollide) continue;
           const ddx = xs[i] - xs[j];
           const ddy = ys[i] - ys[j];
           const rr = rs[i] + rs[j];
@@ -545,9 +551,25 @@ export class Engine {
       }
     }
     survivor.mass = total;
-    survivor.radius = Math.cbrt(
-      survivor.radius ** 3 + other.radius ** 3,
-    );
+    survivor.noCollide = a.noCollide && b.noCollide;
+    if (survivor.isBlackHole || other.isBlackHole) {
+      // 任一为黑洞则合并后仍为黑洞(事件视界只增不减)。
+      // 黑洞视界正比于质量,显示半径按质量比缩放而非体积相加,避免吞星后视界暴涨。
+      const oldMass = survivor.mass - other.mass;
+      if (survivor.isBlackHole && oldMass > 0) {
+        survivor.radius *= Math.cbrt(total / oldMass);
+      } else {
+        survivor.radius = Math.cbrt(
+          survivor.radius ** 3 + other.radius ** 3,
+        );
+      }
+      survivor.isBlackHole = true;
+      survivor.isStar = false;
+    } else {
+      survivor.radius = Math.cbrt(
+        survivor.radius ** 3 + other.radius ** 3,
+      );
+    }
     if (other.isStar && !survivor.isStar && other.mass > survivor.mass * 0.5) {
       survivor.isStar = true;
     }

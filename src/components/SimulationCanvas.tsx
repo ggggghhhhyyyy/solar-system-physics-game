@@ -234,6 +234,12 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
 
     const bodies = engine.bodies;
     const sun = engine.heaviest();
+    // 光照源:优先最重的恒星(黑洞不发光,只有吸积盘辉光);无恒星时回退到最重天体
+    let light: Body | undefined;
+    for (const b of bodies) {
+      if (b.isStar && !b.isBlackHole && (!light || b.mass > light.mass)) light = b;
+    }
+    if (!light) light = sun;
 
     // trails
     if (s.showTrails) {
@@ -361,13 +367,62 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
     // bodies
     for (const b of bodies) {
       const [sx, sy] = toScreen(b.x, b.y);
-      const minPx = b.isStar ? 7 : b.mass > 1e-5 ? 4.5 : 3;
+      const minPx = b.isBlackHole || b.isStar ? 7 : b.mass > 1e-5 ? 4.5 : 3;
       const pr = Math.max(minPx, b.radius * cam.zoom);
-      const margin = b.isStar ? pr * 6 : pr + 40;
+      const margin = b.isBlackHole || b.isStar ? pr * 6 : pr + 40;
       if (sx < -margin || sx > w + margin || sy < -margin || sy > h + margin) continue;
       const [r, g, bl] = rgb(b.color);
 
-      if (b.isStar) {
+      if (b.isBlackHole) {
+        // 外层辉光(吸积盘散射光)
+        const glowR = pr * 5;
+        const glow = ctx.createRadialGradient(sx, sy, pr * 0.5, sx, sy, glowR);
+        glow.addColorStop(0, 'rgba(251,146,60,0.35)');
+        glow.addColorStop(0.45, 'rgba(167,139,250,0.12)');
+        glow.addColorStop(1, 'rgba(167,139,250,0)');
+        ctx.fillStyle = glow;
+        ctx.beginPath();
+        ctx.arc(sx, sy, glowR, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 吸积盘(倾斜椭圆,外暗内亮)
+        ctx.save();
+        ctx.translate(sx, sy);
+        ctx.rotate(-0.35);
+        ctx.strokeStyle = 'rgba(251,146,60,0.35)';
+        ctx.lineWidth = Math.max(1.5, pr * 0.85);
+        ctx.beginPath();
+        ctx.ellipse(0, 0, pr * 3.4, pr * 1.15, 0, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = 'rgba(253,224,171,0.75)';
+        ctx.lineWidth = Math.max(1, pr * 0.55);
+        ctx.beginPath();
+        ctx.ellipse(0, 0, pr * 2.1, pr * 0.72, 0, 0, Math.PI * 2);
+        ctx.stroke();
+        // 多普勒增亮:一侧更亮
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+        ctx.lineWidth = Math.max(1, pr * 0.5);
+        ctx.beginPath();
+        ctx.ellipse(0, 0, pr * 2.1, pr * 0.72, 0, Math.PI * 0.55, Math.PI * 1.15);
+        ctx.stroke();
+        ctx.restore();
+
+        // 事件视界阴影+光子环
+        ctx.fillStyle = '#000000';
+        ctx.beginPath();
+        ctx.arc(sx, sy, pr, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,240,200,0.95)';
+        ctx.lineWidth = Math.max(1.2, pr * 0.12);
+        ctx.beginPath();
+        ctx.arc(sx, sy, pr * 1.02, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = 'rgba(167,139,250,0.5)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(sx, sy, pr * 1.25, 0, Math.PI * 2);
+        ctx.stroke();
+      } else if (b.isStar) {
         const glowR = pr * 5.5;
         const glow = ctx.createRadialGradient(sx, sy, pr * 0.5, sx, sy, glowR);
         glow.addColorStop(0, `rgba(${r},${g},${bl},0.55)`);
@@ -393,8 +448,8 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
         ctx.arc(sx, sy, pr, 0, Math.PI * 2);
         ctx.fill();
         // shading toward light source
-        if (pr >= 3 && sun && sun !== b) {
-          const [lx0, ly0] = toScreen(sun.x, sun.y);
+        if (pr >= 3 && light && light !== b) {
+          const [lx0, ly0] = toScreen(light.x, light.y);
           let lx = lx0 - sx;
           let ly = ly0 - sy;
           const len = Math.hypot(lx, ly) || 1;
@@ -444,7 +499,8 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
         ctx.stroke();
       }
 
-      if (s.showLabels && (b.mass > 1e-8 || selected || b.userLaunched)) {
+      // 卫星/矮行星等有 key 的命名天体在放大后也显示名称(完整太阳系),避免全图 clutter
+      if (s.showLabels && (b.isBlackHole || b.mass > 1e-9 || selected || b.userLaunched || (b.key != null && cam.zoom > 300))) {
         ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
         ctx.fillStyle = selected ? 'rgba(255,255,255,0.95)' : 'rgba(226,232,240,0.7)';
         ctx.textAlign = 'left';
@@ -485,14 +541,22 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
           const hx = -uy * dd * (Math.sqrt(3) / 2);
           const hy = ux * dd * (Math.sqrt(3) / 2);
           pts.push([mx + hx, my + hy, 'L4'], [mx - hx, my - hy, 'L5']);
-          ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+          // 共线虚线 L3—M1—M2—L2,衬托拉格朗日点位置关系
+          const [l3x, l3y] = toScreen(pts[2][0], pts[2][1]);
+          const [l2x, l2y] = toScreen(pts[1][0], pts[1][1]);
+          ctx.strokeStyle = 'rgba(251, 191, 36, 0.18)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4, 5]);
+          ctx.beginPath();
+          ctx.moveTo(l3x, l3y);
+          ctx.lineTo(l2x, l2y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.font = '600 10px ui-sans-serif, system-ui, sans-serif';
           ctx.textAlign = 'left';
           for (const [wx, wy, label] of pts) {
             const [sx, sy] = toScreen(wx, wy);
             if (sx < -20 || sx > w + 20 || sy < -20 || sy > h + 20) continue;
-            ctx.strokeStyle = 'rgba(251, 191, 36, 0.5)';
-            ctx.fillStyle = 'rgba(251, 191, 36, 0.5)';
-            ctx.lineWidth = 1;
             const R = 5;
             ctx.beginPath();
             ctx.moveTo(sx, sy - R);
@@ -500,8 +564,17 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
             ctx.lineTo(sx, sy + R);
             ctx.lineTo(sx - R, sy);
             ctx.closePath();
+            ctx.fillStyle = 'rgba(251, 191, 36, 0.85)';
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255, 240, 200, 0.9)';
+            ctx.lineWidth = 1;
             ctx.stroke();
-            ctx.fillText(label, sx + 7, sy + 3);
+            // 深色描边衬底,保证文字在亮星附近也清晰
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = 'rgba(2, 3, 10, 0.9)';
+            ctx.strokeText(label, sx + 8, sy + 4);
+            ctx.fillStyle = 'rgba(253, 230, 170, 0.95)';
+            ctx.fillText(label, sx + 8, sy + 4);
           }
         }
       }
@@ -511,13 +584,30 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
     if (d && d.mode === 'launch') {
       const lt = LAUNCH_TYPES.find((l) => l.id === s.launchTypeId) ?? LAUNCH_TYPES[0];
       const [gx, gy] = toScreen(d.startWorld.x, d.startWorld.y);
-      const pr = Math.max(lt.isStar ? 7 : 4, lt.radius * cam.zoom);
-      ctx.fillStyle = lt.color;
-      ctx.globalAlpha = 0.85;
-      ctx.beginPath();
-      ctx.arc(gx, gy, pr, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.globalAlpha = 1;
+      const pr = Math.max(lt.isStar || lt.isBlackHole ? 7 : 4, lt.radius * cam.zoom);
+      if (lt.isBlackHole) {
+        ctx.fillStyle = '#000000';
+        ctx.beginPath();
+        ctx.arc(gx, gy, pr, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#a78bfa';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(gx, gy, pr, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = 'rgba(251,146,60,0.7)';
+        ctx.lineWidth = Math.max(1.5, pr * 0.4);
+        ctx.beginPath();
+        ctx.ellipse(gx, gy, pr * 2.2, pr * 0.7, -0.35, 0, Math.PI * 2);
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = lt.color;
+        ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        ctx.arc(gx, gy, pr, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
       if (d.moved) {
         const ex = d.curX;
         const ey = d.curY;
@@ -690,6 +780,7 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
         radius: lt.radius,
         color: lt.color,
         isStar: lt.isStar,
+        isBlackHole: lt.isBlackHole,
         x: d.startWorld.x,
         y: d.startWorld.y,
         vx,

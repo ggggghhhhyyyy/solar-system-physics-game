@@ -12,6 +12,9 @@ export interface Stats {
   biggestUserMass: number;
   longestEarthYears: number;
   totalSimYears: number;
+  stars: number; // 每完成1个每日任务+1，可累计
+  dailyDone: Record<string, string[]>; // date -> [missionId...]
+  dailyAllDoneDates: string[]; // 完成当日全部任务的日期
 }
 
 export interface Achievement {
@@ -30,6 +33,9 @@ const DEFAULTS: Stats = {
   biggestUserMass: 0,
   longestEarthYears: 0,
   totalSimYears: 0,
+  stars: 0,
+  dailyDone: {},
+  dailyAllDoneDates: [],
 };
 
 function normalize(v: unknown): Stats {
@@ -38,6 +44,17 @@ function normalize(v: unknown): Stats {
     typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : f;
   const arr = Array.isArray(o['missionsDone'])
     ? (o['missionsDone'] as unknown[]).filter((x): x is string => typeof x === 'string')
+    : [];
+  const dailyDone: Record<string, string[]> = {};
+  if (typeof o['dailyDone'] === 'object' && o['dailyDone'] !== null) {
+    for (const [k, v] of Object.entries(o['dailyDone'] as Record<string, unknown>)) {
+      if (Array.isArray(v)) {
+        dailyDone[k] = [...new Set(v.filter((x): x is string => typeof x === 'string'))];
+      }
+    }
+  }
+  const dailyAllDoneDates = Array.isArray(o['dailyAllDoneDates'])
+    ? [...new Set((o['dailyAllDoneDates'] as unknown[]).filter((x): x is string => typeof x === 'string'))]
     : [];
   return {
     launches: num(o['launches']),
@@ -48,6 +65,9 @@ function normalize(v: unknown): Stats {
     biggestUserMass: num(o['biggestUserMass']),
     longestEarthYears: num(o['longestEarthYears']),
     totalSimYears: num(o['totalSimYears']),
+    stars: num(o['stars']),
+    dailyDone,
+    dailyAllDoneDates,
   };
 }
 
@@ -107,12 +127,34 @@ export function recordEvents(events: SimEvent[]): Stats {
   return s;
 }
 
-// 记录任务完成(去重)
-export function recordMissionDone(id: string): Stats {
+// 记录任务完成(去重)。date 传入 YYYY-MM-DD 时同步记每日进度+星星。
+export function recordMissionDone(id: string, date?: string): Stats {
   const s = loadStats();
   try {
     if (!s.missionsDone.includes(id)) {
       s.missionsDone.push(id);
+    }
+    if (date) {
+      const list = s.dailyDone[date] ?? [];
+      if (!list.includes(id)) {
+        list.push(id);
+        s.dailyDone[date] = list;
+        s.stars += 1;
+      }
+    }
+    saveStats(s);
+  } catch {
+    // 忽略
+  }
+  return s;
+}
+
+// 记录某日全部每日任务完成(去重)
+export function recordDailyAllDone(date: string): Stats {
+  const s = loadStats();
+  try {
+    if (!s.dailyAllDoneDates.includes(date)) {
+      s.dailyAllDoneDates.push(date);
       saveStats(s);
     }
   } catch {
@@ -144,5 +186,7 @@ export const ACHIEVEMENTS: Achievement[] = [
   { id: 'escape-master', title: '逃逸大师', desc: '最快逃逸速度超过 10 AU/年', check: (s) => s.bestEscapeSpeed > 10 },
   { id: 'creator', title: '造物主', desc: '发射过质量超过 1e-4 M☉ 的天体', check: (s) => s.biggestUserMass > 1e-4 },
   { id: 'guardian', title: '守护者', desc: '地球存活累计超过 5 年', check: (s) => s.longestEarthYears > 5 },
-  { id: 'completionist', title: '任务全满', desc: '完成 9 个任务', check: (s) => s.missionsDone.length >= 9 },
+  { id: 'first-daily', title: '每日首秀', desc: '完成任意 1 个今日太空任务', check: (s) => s.stars >= 1 },
+  { id: 'week-star', title: '一周之星', desc: '累计获得 7 颗星星（每日任务每完成1个得1星）', check: (s) => s.stars >= 7 },
+  { id: 'completionist', title: '今日全满', desc: '完成今日全部 3 个太空任务', check: (s) => (s.dailyAllDoneDates?.length ?? 0) >= 1 },
 ];
