@@ -250,7 +250,7 @@ describe('Physics V2 — 3D state / octree / frames / ephemeris / lagrange', () 
     const spec = createBodyFromEphemeris(
       { name: 'Earth', key: 'earth', mass: 3e-6, physicalRadius: PHYSICAL_RADIUS_AU.earth, color: '#4f9de8' },
       {
-        epoch: '2026-09-11T00:00:00Z',
+        epoch: { jd: 2461294.5, scale: 'TDB' },
         referenceFrame: 'ICRF',
         position: { x: 1, y: 0, z: 0 },
         velocity: { x: 0, y: 2 * Math.PI, z: 0 },
@@ -258,7 +258,9 @@ describe('Physics V2 — 3D state / octree / frames / ephemeris / lagrange', () 
     );
     const e = new Engine();
     e.reset([{ ...SUN, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 }, spec], { epoch: '2026-09-11T00:00:00Z' });
-    assert.equal(e.epoch, '2026-09-11T00:00:00Z');
+    assert.ok(e.epoch);
+    assert.equal(e.epoch.scale, 'UTC');
+    assert.ok(Math.abs(e.epoch.jd - 2461294.5) < 0.001);
     assert.equal(e.bodies[1].x, 1);
     assert.equal(e.bodies[1].vy, 2 * Math.PI);
     assert.ok(e.simulationDate instanceof Date);
@@ -328,7 +330,9 @@ describe('Physics V2 — snapshot migration', () => {
     const e2 = new Engine();
     restoreSnapshot(e2, snap);
     assert.ok(Math.abs(e2.time - t) < 1e-12);
-    assert.equal(e2.epoch, '2026-09-11T00:00:00Z');
+    assert.ok(e2.epoch);
+    assert.equal(e2.epoch.scale, 'UTC');
+    assert.ok(Math.abs(e2.epoch.jd - 2461294.5) < 0.001);
     assert.ok(Math.abs(e2.bodies[1].x - x) < 1e-12);
     assert.ok(e2.bodies[1].physicalRadius < 0.001);
     assert.ok(e2.bodies[1].renderRadius > e2.bodies[1].physicalRadius);

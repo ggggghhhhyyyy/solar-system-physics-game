@@ -1,3 +1,4 @@
+import { isGravitySource, isMassiveBody, isTestParticle } from './body/semantics.ts';
 import {
   BH_THRESHOLD,
   BH_THETA,
@@ -9,6 +10,9 @@ import {
   HASH_Z,
   R_SCHWARZSCHILD_SUN_AU,
   TRAIL_MAX,
+  constantsById,
+  type ConstantsSet,
+  type PhysicsConstants,
 } from './constants.ts';
 import {
   computeConservation,
@@ -16,14 +20,24 @@ import {
   type ConservationSnapshot,
   type DriftReport,
 } from './diagnostics/conservation.ts';
+import {
+  getDominantGravitySource,
+  getHeaviestMassiveBody,
+  getPrimaryStar,
+  getReferencePrimary,
+} from './frames/referenceFrames.ts';
 import { leapfrog } from './integrators/leapfrog.ts';
 import { addForceFromOctree, OctNode } from './octree.ts';
 import { classicalElements, type ClassicalElements } from './orbital/elements.ts';
+import { isTideCandidate } from './orbital/encounters.ts';
 import { rocheLimitAU } from './orbital/roche.ts';
+import { SpatialHash3D } from './spatial/hash3d.ts';
+import { coerceEpoch, epochToUtcJd, formatCalendarFromJd, isEpoch, jdToUnixMs, type Epoch } from './time/epoch.ts';
 import type { Body, BodySpec, GravityMode, Integrator, SimEvent, StateVector } from './types.ts';
 import { finite3 } from './vec.ts';
 
 export { G0, TRAIL_MAX };
+export { isMassiveBody, isTestParticle, isGravitySource };
 
 function schwarzschildAU(mass: number): number {
   return R_SCHWARZSCHILD_SUN_AU * Math.max(mass, 0);
@@ -63,11 +77,16 @@ export class Engine {
   trailInterval = 0.0025;
   escapeDistance = 400;
   integrator: Integrator = leapfrog;
-  /** ISO-8601 epoch. Null → UI shows T+ elapsed. */
-  epoch: string | null = null;
   /**
-   * Split a step into n leapfrog substeps when an encounter timescale
-   * is shorter than dt. Each substep still uses the symplectic KDK kick.
+   * Formal epoch (JD + scale). Null → UI shows T+ elapsed.
+   * This is the scientific time model; Date is a UI projection.
+   */
+  epoch: Epoch | null = null;
+  constants: PhysicsConstants = constantsById('gaussian');
+  /**
+   * Adaptive substepping: split one leapfrog step into n fixed KDK substeps
+   * when an encounter / free-fall timescale is shorter than dt.
+   * This is NOT a time-transformed symplectic integrator.
    * Off by default so game presets do not change.
    */
   adaptiveDt = false;
@@ -90,7 +109,12 @@ export class Engine {
   private sr = new Float64Array(0);
 
   get G(): number {
-    return G0 * this.gMultiplier;
+    return this.constants.muSun * this.gMultiplier;
+  }
+
+  setConstants(id: ConstantsSet): void {
+    this.constants = constantsById(id);
+    this.needAccel = true;
   }
 
   /** Years since reset. */
@@ -98,12 +122,35 @@ export class Engine {
     return this.time;
   }
 
-  /** Wall-clock simulation date, or null when no epoch is set. */
+  /** Julian Date of the current simulation instant, or null if no epoch. */
+  simulationJulianDate(): number | null {
+    if (!this.epoch) return null;
+    return this.epoch.jd + this.time * 365.25;
+  }
+
+  /**
+   * UI wall-clock in UTC. TDB epochs are converted (leap-second approximation).
+   * Do not use this as the physics time model.
+   */
   get simulationDate(): Date | null {
     if (!this.epoch) return null;
-    const t0 = Date.parse(this.epoch);
-    if (!Number.isFinite(t0)) return null;
-    return new Date(t0 + this.time * 365.25 * 86_400_000);
+    const jdUtc = epochToUtcJd({ jd: this.epoch.jd + this.time * 365.25, scale: this.epoch.scale });
+    const ms = jdToUnixMs(jdUtc);
+    if (!Number.isFinite(ms)) return null;
+    return new Date(ms);
+  }
+
+  simulationCalendar(): { tdb: string | null; utc: string | null; jd: string | null } {
+    if (!this.epoch) return { tdb: null, utc: null, jd: null };
+    const jd = this.simulationJulianDate()!;
+    const tdb = formatCalendarFromJd(this.epoch.scale === 'UTC' ? jd + 69.184 / 86400 : jd);
+    const utcDate = this.simulationDate;
+    const utc = utcDate ? utcDate.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '') + ' UTC' : null;
+    return {
+      tdb: `${tdb} TDB`,
+      utc,
+      jd: `JD ${jd.toFixed(5)} ${this.epoch.scale}`,
+    };
   }
 
   private ensureBuffers(n: number): void {
@@ -154,7 +201,7 @@ export class Engine {
     };
   }
 
-  reset(specs: BodySpec[], opts?: { epoch?: string | null }): void {
+  reset(specs: BodySpec[], opts?: { epoch?: Epoch | string | null; constants?: ConstantsSet }): void {
     this.time = 0;
     this.lastTrailTime = 0;
     this.events = [];
@@ -162,7 +209,12 @@ export class Engine {
     this.bodies = specs.map((s) => this.makeBody(s));
     this.needAccel = true;
     this.tideInside.clear();
-    if (opts && 'epoch' in opts) this.epoch = opts.epoch ?? null;
+    if (opts && 'constants' in opts && opts.constants) this.setConstants(opts.constants);
+    if (opts && 'epoch' in opts) {
+      if (opts.epoch == null) this.epoch = null;
+      else if (isEpoch(opts.epoch)) this.epoch = { jd: opts.epoch.jd, scale: opts.epoch.scale };
+      else this.epoch = coerceEpoch(opts.epoch, 'UTC');
+    }
     this.computeAccel();
     this.baseline = computeConservation(this.bodies, this.G, this.softening);
   }
@@ -190,10 +242,28 @@ export class Engine {
     return e;
   }
 
+  getHeaviestMassiveBody(): Body | undefined {
+    return getHeaviestMassiveBody(this.bodies);
+  }
+
+  getPrimaryStar(): Body | undefined {
+    return getPrimaryStar(this.bodies);
+  }
+
+  getDominantGravitySource(): Body | undefined {
+    return getDominantGravitySource(this.bodies);
+  }
+
+  getReferencePrimary(): Body | undefined {
+    return getReferencePrimary(this.bodies);
+  }
+
+  /**
+   * @deprecated Use getHeaviestMassiveBody / getPrimaryStar / getDominantGravitySource.
+   * Kept as an alias of getHeaviestMassiveBody so a 100 M☉ test particle cannot become the sun.
+   */
   heaviest(): Body | undefined {
-    let best: Body | undefined;
-    for (const b of this.bodies) if (!best || b.mass > best.mass) best = b;
-    return best;
+    return this.getHeaviestMassiveBody();
   }
 
   clearTrails(): void {
@@ -238,10 +308,6 @@ export class Engine {
     );
   }
 
-  private isMassive(b: Body): boolean {
-    return b.gravityMode !== 'test-particle' && b.mass > 0;
-  }
-
   private computeAccel(): void {
     const bs = this.bodies;
     const n = bs.length;
@@ -252,7 +318,7 @@ export class Engine {
     const massiveIdx: number[] = [];
     const testIdx: number[] = [];
     for (let i = 0; i < n; i++) {
-      if (this.isMassive(bs[i])) massiveIdx.push(i);
+      if (isGravitySource(bs[i])) massiveIdx.push(i);
       else testIdx.push(i);
     }
 
@@ -426,28 +492,59 @@ export class Engine {
     this.needAccel = false;
   }
 
+  /**
+   * Adaptive substepping count for the next UI step.
+   * Skips test-particle ↔ test-particle pairs (no mutual gravity, default noCollide).
+   * Combines encounter timescale r/v with a free-fall timescale sqrt(r/|a|)
+   * so a close, slow pair is still subdivided.
+   */
   suggestedSubsteps(): number {
     if (!this.adaptiveDt) return 1;
     let tau = Infinity;
     const bs = this.bodies;
     const n = bs.length;
+    const G = this.G;
+    const massive: Body[] = [];
+    const tracers: Body[] = [];
     for (let i = 0; i < n; i++) {
-      const a = bs[i];
-      for (let j = i + 1; j < n; j++) {
-        const b = bs[j];
-        if (a.noCollide && b.noCollide) continue;
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        const dz = a.z - b.z;
-        const r = Math.hypot(dx, dy, dz);
-        if (!(r > 0) || !Number.isFinite(r)) continue;
-        const v = Math.hypot(a.vx - b.vx, a.vy - b.vy, a.vz - b.vz);
-        if (v > 1e-18) {
-          const t = r / v;
-          if (t < tau) tau = t;
-        }
+      if (isMassiveBody(bs[i])) massive.push(bs[i]);
+      else tracers.push(bs[i]);
+    }
+
+    const consider = (a: Body, b: Body) => {
+      const dx = a.x - b.x;
+      const dy = a.y - b.y;
+      const dz = a.z - b.z;
+      const r = Math.hypot(dx, dy, dz);
+      if (!(r > 0) || !Number.isFinite(r)) return;
+      const v = Math.hypot(a.vx - b.vx, a.vy - b.vy, a.vz - b.vz);
+      const coll = a.collisionRadius + b.collisionRadius;
+      const gap = Math.max(r - coll, r * 0.05, 1e-12);
+      if (v > 1e-18) {
+        const tEnc = gap / v;
+        if (tEnc < tau) tau = tEnc;
+      }
+      const amag = Math.hypot(a.ax - b.ax, a.ay - b.ay, a.az - b.az);
+      if (amag > 1e-30) {
+        const tAcc = Math.sqrt(r / amag);
+        if (tAcc < tau) tau = tAcc;
+      }
+      const mSrc = (isMassiveBody(a) ? a.mass : 0) + (isMassiveBody(b) ? b.mass : 0);
+      if (mSrc > 0 && G > 0) {
+        const tOrb = 0.05 * 2 * Math.PI * Math.sqrt((r * r * r) / (G * mSrc));
+        if (tOrb < tau) tau = tOrb;
+      }
+    };
+
+    for (let i = 0; i < massive.length; i++) {
+      for (let j = i + 1; j < massive.length; j++) consider(massive[i], massive[j]);
+      for (let t = 0; t < tracers.length; t++) {
+        const p = tracers[t];
+        if (p.noCollide && massive[i].noCollide) continue;
+        consider(massive[i], p);
       }
     }
+
     if (!Number.isFinite(tau)) return 1;
     const target = Math.max(tau * 0.05, this.dt / this.maxSubsteps);
     return Math.max(1, Math.min(this.maxSubsteps, Math.ceil(this.dt / target)));
@@ -461,29 +558,59 @@ export class Engine {
     const bs = this.bodies;
     const n = bs.length;
     const inside = new Set<string>();
-    for (let i = 0; i < n; i++) {
-      for (let j = i + 1; j < n; j++) {
-        const a = bs[i];
-        const b = bs[j];
-        const primary = a.mass >= b.mass ? a : b;
-        const sat = primary === a ? b : a;
-        if (!(sat.mass > 0) || sat.isBlackHole) continue;
-        const d = rocheLimitAU(primary, sat, 'fluid');
-        if (d == null) continue;
-        const r = Math.hypot(sat.x - primary.x, sat.y - primary.y, sat.z - primary.z);
-        if (!(r < d)) continue;
-        const key = this.pairTideKey(a, b);
-        inside.add(key);
-        if (this.tideInside.has(key)) continue;
-        const tde = !!primary.isBlackHole && r > primary.physicalRadius;
-        this.events.push({
-          type: tde ? 'tde' : 'roche',
-          time: this.time,
-          primary,
-          secondary: sat,
-          separationAU: r,
-          rocheAU: d,
-        });
+    const massive: Body[] = [];
+    for (let i = 0; i < n; i++) if (isMassiveBody(bs[i])) massive.push(bs[i]);
+    if (massive.length === 0) {
+      this.tideInside = inside;
+      return;
+    }
+
+    const considerPair = (a: Body, b: Body) => {
+      if (!isTideCandidate(a, b)) return;
+      const primary = a.mass >= b.mass ? a : b;
+      const sat = primary === a ? b : a;
+      const d = rocheLimitAU(primary, sat, 'fluid');
+      if (d == null) return;
+      const r = Math.hypot(sat.x - primary.x, sat.y - primary.y, sat.z - primary.z);
+      if (!(r < d)) return;
+      const key = this.pairTideKey(a, b);
+      inside.add(key);
+      if (this.tideInside.has(key)) return;
+      const tde = !!primary.isBlackHole && r > primary.physicalRadius;
+      this.events.push({
+        type: tde ? 'tde' : 'roche',
+        time: this.time,
+        primary,
+        secondary: sat,
+        separationAU: r,
+        rocheAU: d,
+      });
+    };
+
+    if (n < 80) {
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) considerPair(bs[i], bs[j]);
+      }
+    } else {
+      let maxD = 0;
+      for (const p of massive) {
+        for (const s of bs) {
+          if (s === p) continue;
+          const d = rocheLimitAU(p, s, 'fluid');
+          if (d != null && d > maxD) maxD = d;
+        }
+      }
+      const cell = Math.max(maxD * 2, 0.01);
+      const hash = new SpatialHash3D(cell);
+      for (let i = 0; i < n; i++) hash.insert(i, bs[i].x, bs[i].y, bs[i].z);
+      for (const p of massive) {
+        const neigh = hash.queryCellNeighbors(p.x, p.y, p.z);
+        for (const j of neigh) {
+          const s = bs[j];
+          if (s === p) continue;
+          if (s.id < p.id && isMassiveBody(s)) continue;
+          considerPair(p, s);
+        }
       }
     }
     this.tideInside = inside;
@@ -527,7 +654,7 @@ export class Engine {
   }
 
   private removeEscapees(): void {
-    const ref = this.heaviest();
+    const ref = this.getDominantGravitySource();
     if (!ref) return;
     const lim2 = this.escapeDistance * this.escapeDistance;
     for (let i = this.bodies.length - 1; i >= 0; i--) {
@@ -781,8 +908,8 @@ export class Engine {
     dtMul = 4,
   ): number[] {
     const massive = this.bodies.length > 40
-      ? this.bodies.filter((b) => this.isMassive(b) && b.mass > 1e-8)
-      : this.bodies.filter((b) => this.isMassive(b));
+      ? this.bodies.filter((b) => isMassiveBody(b) && b.mass > 1e-8)
+      : this.bodies.filter((b) => isMassiveBody(b));
     const n = massive.length + 1;
     const xs = new Float64Array(n);
     const ys = new Float64Array(n);

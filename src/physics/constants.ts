@@ -1,18 +1,29 @@
 /**
  * Canonical units for the physics engine.
  *
- * PHYSICAL MODEL
- *   length: AU
- *   time:   year  (Gaussian: circular orbit at 1 AU around 1 M☉ has P = 1 yr)
- *   mass:   solar mass M☉
- *   G0:     4 π²  AU³ / (M☉ yr²)
+ * Two gravitational-parameter systems exist. They are NOT silently mixed.
  *
- * SI conversions below are used only for *derived scientific properties*
- * (surface gravity, density, km/s). Dynamics always use G0.
+ * GAME / Gaussian (default presets):
+ *   G0 = 4π² AU³ M☉⁻¹ yr⁻²
+ *   A circular 1 AU orbit around 1 M☉ has P = 1 yr exactly.
+ *   GAMEPLAY / pedagogical unit choice.
+ *
+ * SCIENCE / DE440:
+ *   μ☉ from DE440 GM_sun converted to AU³ / yr² (Julian year).
+ *   Used when ingesting Horizons / DE441 state vectors so dynamics
+ *   and masses share one constant system.
+ *
+ * Relative difference is ~3.8e-5. Documented, not hidden.
  */
 
-/** Gravitational constant in AU³ / (M☉ yr²). PHYSICAL MODEL. */
-export const G0 = 4 * Math.PI * Math.PI;
+export type ConstantsSet = 'gaussian' | 'de440';
+
+export interface PhysicsConstants {
+  /** Gravitational parameter of 1 M☉ in AU³ / yr². */
+  muSun: number;
+  id: ConstantsSet;
+  label: string;
+}
 
 /** Astronomical unit in metres (IAU 2012 exact). */
 export const AU_M = 149_597_870_700;
@@ -22,17 +33,49 @@ export const DAYS_PER_YEAR = 365.25;
 /** Julian year in seconds. */
 export const YEAR_S = DAYS_PER_YEAR * 86_400;
 
-/** Solar mass in kg (IAU 2015 conventional). */
+/** Solar mass in kg (IAU 2015 conventional). Used only for SI derived props. */
 export const M_SUN_KG = 1.988_47e30;
-
-/** Earth mass in solar masses (engine mass unit). */
-export const M_EARTH = 3.003_489e-6;
 
 /** Newtonian G (SI). Used only for derived scientific properties. */
 export const G_SI = 6.674_30e-11;
 
 /** Speed of light (m/s). */
 export const C_SI = 299_792_458;
+
+/**
+ * DE440 GM_sun in km³/s².
+ * Source: JPL DE440, GM_sun = 132712440041.279419 km³ s⁻²
+ * (same value used to form catalog mass ratios GM/GM☉).
+ */
+export const GM_SUN_KM3_S2 = 132_712_440_041.279419;
+
+const AU_KM = AU_M / 1000;
+
+/** DE440 μ☉ in engine units (AU³ / yr²). PHYSICAL MODEL for SCIENCE / JPL. */
+export const GM_SUN_AU3_YR2 =
+  (GM_SUN_KM3_S2 * YEAR_S * YEAR_S) / (AU_KM * AU_KM * AU_KM);
+
+/** Gaussian gravitational parameter. GAME / pedagogical. */
+export const G0 = 4 * Math.PI * Math.PI;
+
+export const GAUSSIAN_CONSTANTS: PhysicsConstants = {
+  id: 'gaussian',
+  muSun: G0,
+  label: 'Gaussian G = 4π² (1 AU / 1 M☉ / 1 yr)',
+};
+
+export const DE440_CONSTANTS: PhysicsConstants = {
+  id: 'de440',
+  muSun: GM_SUN_AU3_YR2,
+  label: 'DE440 μ☉ (AU³/yr², Julian year)',
+};
+
+export function constantsById(id: ConstantsSet | undefined): PhysicsConstants {
+  return id === 'de440' ? DE440_CONSTANTS : GAUSSIAN_CONSTANTS;
+}
+
+/** Earth mass in solar masses (engine mass unit). */
+export const M_EARTH = 3.003_489e-6;
 
 /** Solar radius in AU. PHYSICAL MODEL. */
 export const R_SUN_AU = 6.957e8 / AU_M;
@@ -96,5 +139,10 @@ export const PHYSICAL_RADIUS_AU: Record<string, number> = {
   trappist1: 0.119 * R_SUN_AU,
 };
 
-/** Default epoch for real-solar-system flavoured presets. */
-export const DEFAULT_EPOCH = '2026-09-11T00:00:00Z';
+/**
+ * Game-preset clock origin. UTC civil date — NOT the DE441 TDB cache epoch.
+ * Do not suffix TDB calendars with Z.
+ */
+export const DEFAULT_EPOCH_UTC = '2026-09-11T00:00:00Z';
+/** @deprecated Use DEFAULT_EPOCH_UTC. Kept so older imports compile. */
+export const DEFAULT_EPOCH = DEFAULT_EPOCH_UTC;

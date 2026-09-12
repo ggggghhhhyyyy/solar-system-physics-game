@@ -1,7 +1,9 @@
-# Physics Simulation V2 — Phase 1 + Phase 2
+# Physics Simulation V2 — Hardening (Phases 1–3)
 
 NASA / JPL-ready scientific foundation. This document is the source of truth
 for what is **physical**, what is **visual**, and what is **gameplay**.
+
+**Render can lie. Physics cannot.**
 
 ---
 
@@ -12,8 +14,9 @@ for what is **physical**, what is **visual**, and what is **gameplay**.
 | Position | AU | IAU 2012 exact: 1 AU = 149 597 870 700 m |
 | Velocity | AU / year | Gaussian year: circular 1 AU / 1 M☉ has P = 1 |
 | Mass | M☉ | 1.98847 × 10³⁰ kg |
-| Time | year | engine `time` is years since reset |
-| G | 4π² AU³ M☉⁻¹ yr⁻² | **PHYSICAL MODEL** |
+| Time | year | engine `time` is years since reset. Scientific clock is `Epoch { jd, scale }` |
+| G (GAME) | 4π² AU³ M☉⁻¹ yr⁻² | Gaussian pedagogical unit. 1 AU / 1 M☉ / 1 yr |
+| μ☉ (SCIENCE/JPL) | DE440 GM_sun → AU³/yr² | `GM_SUN_AU3_YR2`. Used with Horizons / DE441 states |
 
 Derived scientific properties (g, density, km/s) use SI G, not 4π².
 The two constants differ by ~5 × 10⁻⁵; documented, not hidden.
@@ -220,9 +223,11 @@ NASA/JPL adapter  →  normalized EphemerisState  →  Physics Engine
 |---|---|
 | `types.ts` | `EphemerisState` {epoch, frame, r, v} in AU / AU year⁻¹ |
 | `catalog.ts` | DE440 GM/GM☉ masses, Horizons IDs, physical radii. Engine never sees the IDs |
-| `horizonsParse.ts` | `$$SOE`/`$$EOE` VECTOR parser. AU-D → AU/year via ×365.25 |
-| `horizons.server.ts` | Sequential HTTP to `ssd.jpl.nasa.gov/api/horizons.api`. 503/429 retry |
-| `horizons.functions.ts` | `createServerFn` POST, Zod, **no auth** (world-readable NASA data) |
+| `horizonsParse.ts` | `$$SOE`/`$$EOE` VECTOR parser. AU-D → AU/year via ×365.25. First sample only |
+| `horizonsRequest.ts` | Browser ↔ `/api/horizons` contract. Catalog keys + epoch. **No URL field** |
+| `horizonsClient.ts` | Browser POST `/api/horizons`. NASA URL is not present |
+| `horizonsApi.server.ts` | Server-only whitelist, timeout, 429/503 retry, NASA fetch |
+| `src/routes/api/horizons.ts` | TanStack Start POST handler. Rejects open URL proxy |
 | `horizonsCache.ts` | Baked DE441 geometric states at **2026-09-11 00:00 TDB** |
 | `keplerian.ts` | JPL “Approximate Positions” Table 1/2. **PHYSICAL APPROXIMATION** |
 | `normalize.ts` | Identity + state → `BodySpec`. No HTTP |
@@ -302,12 +307,115 @@ linear t_CA, Roche flag.
 `t_CA = −(r·v)/(v·v)` is a **PHYSICAL APPROXIMATION** (constant velocity).
 It is a short-horizon warning, not an ephemeris.
 
-### 13.3 Adaptive leapfrog substeps
+### 13.3 Adaptive substepping
 
 `Engine.adaptiveDt` (off for game presets, on after a NASA load).
-When min(r/v_rel) < dt, split one UI step into up to 16 KDK substeps.
-The integrator is still leapfrog. Variable-dt leapfrog is **not** claimed
-symplectic across the split; each substep is.
+When encounter / free-fall / orbital timescales are shorter than `dt`,
+split one UI step into up to 16 **fixed** KDK substeps.
+
+This is **adaptive substepping**, not a time-transformed symplectic
+integrator. Tracer ↔ tracer pairs are not scanned.
+
+---
+
+## 14. V2 Hardening
+
+### 14.1 Massive-body semantics
+
+`src/physics/body/semantics.ts`
+
+`isMassiveBody` / `isTestParticle` / `isGravitySource` are the only
+allowed classifiers. Used by:
+
+- N-body gravity sources
+- barycentre
+- conservation totals
+- primary / dominant gravity source
+- Roche / encounter scans
+
+A 100 M☉ test particle cannot become the Sun, the barycentre, or the
+heliocentric origin.
+
+Primary APIs (`src/physics/frames/referenceFrames.ts`):
+
+- `getHeaviestMassiveBody()`
+- `getPrimaryStar()`
+- `getDominantGravitySource()`
+- `getReferencePrimary()`
+
+`Engine.heaviest()` is a deprecated alias of `getHeaviestMassiveBody()`.
+
+Reference frames are **analysis / display transforms**. Switching the UI
+frame never mutates engine inertial state.
+
+### 14.2 Time / Epoch
+
+`src/physics/time/epoch.ts`
+
+```
+interface Epoch { jd: number; scale: 'UTC' | 'TDB' | 'TT' }
+```
+
+The DE441 cache epoch is `{ jdTdb: 2461294.5, calendar: '2026-09-11 00:00:00', scale: 'TDB' }`.
+It is **not** `2026-09-11T00:00:00Z`.
+
+TDB−UTC ≈ leap seconds + 32.184 s. The ~1.6 ms TDB−TT periodic term is
+neglected (**NUMERICAL APPROXIMATION**).
+
+### 14.3 Ephemeris modes
+
+| Mode | Path | Failure |
+|---|---|---|
+| `horizons` | cache or live via `/api/horizons` | **error**, no Keplerian fallback |
+| `auto` | cache → live → Keplerian | allowed; UI shows `SOURCE: KEPLERIAN FALLBACK` |
+| `keplerian` | JPL approx elements | UI shows `PHYSICAL APPROXIMATION` |
+
+Browser never talks to NASA. Client may only send catalog keys + epoch.
+
+### 14.4 Constants
+
+| Set | When | μ☉ |
+|---|---|---|
+| `gaussian` | GAME presets | 4π² |
+| `de440` | Horizons / DE441 loads | `GM_SUN_AU3_YR2` from DE440 GM_sun |
+
+Relative difference ~3.8×10⁻⁵. Old presets stay Gaussian so they do not
+explode.
+
+### 14.5 3D orbit overlay
+
+`sampleOsculatingOrbit(elements) → stateFromElements(ν) → xyProjection`
+
+SCIENCE orbit rings are the 2D projection of a 3D osculating Keplerian
+path. They are **not** a refit of the xy velocity.
+
+### 14.6 Performance
+
+Adaptive substeps, Roche/TDE, and global closest-encounter skip
+tracer↔tracer. Global encounters use a 3D spatial hash for large N.
+Selected encounters are O(N).
+
+`npm run bench` reports force / encounter / step ms at N = 100 / 1k / 10k.
+
+### 14.7 Tests A–I
+
+`src/physics/hardening.test.ts`
+
+- A barycentre ignores 100 M☉ test particle
+- B primary ignores 100 M☉ test particle
+- C `source=horizons` rejects on fetch failure; URL proxy forbidden
+- D `source=auto` Keplerian fallback with warning
+- E cache epoch is TDB, not Z-UTC
+- F inclined osculating samples leave the xy plane
+- G tracers out of conservation / COM / gravity tree
+- H Earth radius ~6371 km
+- I DE441 +1/7/30 d Earth/Moon/Jupiter drift vs baked Horizons fixtures
+
+### 14.8 Phase 4 is **not** this round
+
+No spacecraft engines, fuel, thrust, Lambert, Hohmann, GR, hydro Roche,
+SPICE kernels, or Three.js camera.
+
 
 ### 13.4 Major satellites
 

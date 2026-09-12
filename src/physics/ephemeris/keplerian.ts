@@ -9,6 +9,8 @@
  * No Moon, no spacecraft — those need Horizons.
  */
 import { G0 } from '../constants.ts';
+import { isMassiveBody } from '../body/semantics.ts';
+import { coerceEpoch, epochToTdbJd, formatCalendarFromJd, J2000_JD, type Epoch } from '../time/epoch.ts';
 import { stateFromElements } from '../orbital/elements.ts';
 import type { BodySpec } from '../types.ts';
 import { catalogByKey, KEPLERIAN_KEYS } from './catalog.ts';
@@ -59,7 +61,6 @@ const TABLE2: ElemRow[] = [
 ];
 
 const DEG = Math.PI / 180;
-const J2000 = 2451545.0;
 
 export function julianDateUTC(iso: string): number {
   const ms = Date.parse(iso);
@@ -127,7 +128,7 @@ function barycentricShift(bodies: BodySpec[]): BodySpec[] {
   let py = 0;
   let pz = 0;
   for (const b of bodies) {
-    if (!(b.mass > 0)) continue;
+    if (!isMassiveBody(b)) continue;
     m += b.mass;
     x += b.mass * b.x;
     y += b.mass * b.y;
@@ -154,10 +155,12 @@ function barycentricShift(bodies: BodySpec[]): BodySpec[] {
   }));
 }
 
-export function keplerianSolarSystem(epochIso: string): LoadedSolarSystem {
-  const jd = julianDateUTC(epochIso);
-  const T = (jd - J2000) / 36525;
-  const year = new Date(Date.parse(epochIso)).getUTCFullYear();
+export function keplerianSolarSystem(input: Epoch | string): LoadedSolarSystem {
+  const epoch = coerceEpoch(input, 'UTC');
+  const jdTdb = epochToTdbJd(epoch);
+  const T = (jdTdb - J2000_JD) / 36525;
+  const calendar = formatCalendarFromJd(jdTdb);
+  const year = Number(calendar.slice(0, 4));
   const { rows, extra } = tableForYear(year);
   const warnings: string[] = [
     'PHYSICAL APPROXIMATION — JPL Keplerian approximation (two-body, ecliptic J2000). Earth is the Earth–Moon barycentre.',
@@ -170,7 +173,7 @@ export function keplerianSolarSystem(epochIso: string): LoadedSolarSystem {
   const sunId = catalogByKey('sun')!;
   const heliocentric: BodySpec[] = [
     createBodyFromEphemeris(sunId, {
-      epoch: epochIso,
+      epoch,
       referenceFrame: 'Ecliptic J2000 heliocentric',
       position: { x: 0, y: 0, z: 0 },
       velocity: { x: 0, y: 0, z: 0 },
@@ -182,7 +185,7 @@ export function keplerianSolarSystem(epochIso: string): LoadedSolarSystem {
     if (!id) continue;
     const st = heliocentricState(row, T);
     const state: EphemerisState = {
-      epoch: epochIso,
+      epoch,
       referenceFrame: 'Ecliptic J2000 heliocentric',
       position: { x: st.x, y: st.y, z: st.z },
       velocity: { x: st.vx, y: st.vy, z: st.vz },
@@ -198,8 +201,8 @@ export function keplerianSolarSystem(epochIso: string): LoadedSolarSystem {
   }
 
   return {
-    epoch: epochIso,
-    timeScale: 'UTC',
+    epoch,
+    timeScale: epoch.scale,
     source: 'keplerian',
     referenceFrame: 'Ecliptic J2000 SSB (shifted from heliocentric Keplerian)',
     center: 'Solar System Barycenter (constructed)',
@@ -208,5 +211,7 @@ export function keplerianSolarSystem(epochIso: string): LoadedSolarSystem {
     dt: 0.00015,
     softening: 1e-6,
     warnings,
+    constants: 'gaussian',
+    fallback: false,
   };
 }

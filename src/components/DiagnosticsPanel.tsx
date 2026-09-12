@@ -82,6 +82,9 @@ export default function DiagnosticsPanel({
                   {encounter.approaching ? ' ↓' : ''}
                 </span>
               </div>
+              <div className="mt-0.5 inline-block rounded border border-amber-400/30 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-amber-200">
+                LINEAR APPROX
+              </div>
               <div className="flex justify-between gap-2 font-mono">
                 <span className="text-slate-400">Roche</span>
                 <span className={encounter.insideRoche ? 'text-rose-300' : 'text-slate-100'}>
@@ -90,7 +93,7 @@ export default function DiagnosticsPanel({
                 </span>
               </div>
               <p className="mt-1 text-[9px] leading-relaxed text-slate-500">
-                t_CA 为匀速直线近似，不是开普勒星历。
+                t_CA 是匀速直线近似（LINEAR APPROX），不是开普勒星历，也不是精确交会预报。
               </p>
             </div>
           )}

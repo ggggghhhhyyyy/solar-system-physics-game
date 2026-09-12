@@ -1,11 +1,38 @@
 /**
- * Geometric Cartesian states at 2026-09-11 00:00 TDB.
+ * Geometric Cartesian states at 2026-09-11 00:00:00 TDB.
  * Source: JPL Horizons API, DE441, CENTER=500@0, REF_PLANE=ECLIPTIC, OUT_UNITS=AU-D.
  * Converted to AU / year. Not invented.
+ *
+ * The cache epoch is TDB. It is NOT 2026-09-11T00:00:00Z (UTC).
  */
+import type { Epoch } from '../time/epoch.ts';
+import { coerceEpoch, epochsEqual, SECONDS_PER_DAY } from '../time/epoch.ts';
 import type { EphemerisState } from './types.ts';
 
-export const HORIZONS_CACHE_EPOCH = '2026-09-11T00:00:00Z';
+export const HORIZONS_CACHE_EPOCH = {
+  jdTdb: 2461294.5,
+  calendar: '2026-09-11 00:00:00',
+  scale: 'TDB' as const,
+};
+
+export const HORIZONS_CACHE_EPOCH_OBJ: Epoch = {
+  jd: HORIZONS_CACHE_EPOCH.jdTdb,
+  scale: 'TDB',
+};
+
+export const HORIZONS_CACHE_PROVENANCE = {
+  source: 'JPL Horizons',
+  ephemeris: 'DE441',
+  center: '500@0',
+  refPlane: 'ECLIPTIC',
+  refSystem: 'ICRF',
+  vecCorr: 'NONE',
+  outputUnits: 'AU-D',
+  epochJD: HORIZONS_CACHE_EPOCH.jdTdb,
+  timeScale: 'TDB' as const,
+  calendar: HORIZONS_CACHE_EPOCH.calendar,
+  generatedAt: '2026-09-11',
+};
 
 type Cached = { x: number; y: number; z: number; vx: number; vy: number; vz: number };
 
@@ -36,18 +63,17 @@ export const HORIZONS_CACHE_2026_09_11: Record<string, Cached> = {
   charon: { x: 19.90922652121856, y: -29.39628080121748, z: -2.613245185309619, vx: 1.01273109096222, vy: 0.4126668657193556, vz: -0.33720198056888473 },
 };
 
-export function cacheMatchesEpoch(iso: string): boolean {
-  const t = Date.parse(iso);
-  const c = Date.parse(HORIZONS_CACHE_EPOCH);
-  if (!Number.isFinite(t) || !Number.isFinite(c)) return false;
-  return Math.abs(t - c) < 60_000;
+export function cacheMatchesEpoch(input: Epoch | string): boolean {
+  const epoch = coerceEpoch(input, 'TDB');
+  // 2 minutes covers TDB−UTC (~69 s) when the civil midnight is the same date.
+  return epochsEqual(epoch, HORIZONS_CACHE_EPOCH_OBJ, 120 / SECONDS_PER_DAY);
 }
 
-export function cachedState(key: string, epochIso: string): EphemerisState | null {
+export function cachedState(key: string, epoch: Epoch): EphemerisState | null {
   const b = HORIZONS_CACHE_2026_09_11[key];
   if (!b) return null;
   return {
-    epoch: epochIso,
+    epoch,
     referenceFrame: 'Ecliptic J2000 SSB',
     position: { x: b.x, y: b.y, z: b.z },
     velocity: { x: b.vx, y: b.vy, z: b.vz },

@@ -20,7 +20,13 @@ interface PlanetOpts {
   isBlackHole?: boolean;
   noCollide?: boolean;
   ring?: boolean;
-  ecc?: number;
+  /** Tangential velocity multiplier. NOT eccentricity. */
+  speedMultiplier?: number;
+  /** True Keplerian eccentricity. When set, uses stateFromElements. */
+  eccentricity?: number;
+  longitudeAscendingNode?: number;
+  argumentOfPeriapsis?: number;
+  trueAnomaly?: number;
   retro?: boolean;
   physicalRadius?: number;
   renderRadius?: number;
@@ -56,11 +62,22 @@ export function orbiting(
 ): BodySpec {
   const th = (angleDeg * Math.PI) / 180;
   const i = ((opts.iDeg ?? 0) * Math.PI) / 180;
-  const lan = ((opts.lanDeg ?? 0) * Math.PI) / 180;
+  const lan = opts.longitudeAscendingNode ?? ((opts.lanDeg ?? 0) * Math.PI) / 180;
   const mu = G0 * M;
   let x: number, y: number, z: number, vx: number, vy: number, vz: number;
-  const vMul = (opts.ecc ?? 1) * (opts.retro ? -1 : 1);
-  if (Math.abs(i) > 1e-12) {
+  const vMul = (opts.speedMultiplier ?? 1) * (opts.retro ? -1 : 1);
+  const e = opts.eccentricity;
+  if (e != null && e >= 0) {
+    const omega = opts.argumentOfPeriapsis ?? 0;
+    const nu = opts.trueAnomaly ?? th;
+    const st = stateFromElements(a, e, i, lan, omega, nu, mu);
+    x = center.x + st.x;
+    y = center.y + st.y;
+    z = (center.z ?? 0) + st.z;
+    vx = center.vx + st.vx * (opts.retro ? -1 : 1);
+    vy = center.vy + st.vy * (opts.retro ? -1 : 1);
+    vz = (center.vz ?? 0) + st.vz * (opts.retro ? -1 : 1);
+  } else if (Math.abs(i) > 1e-12) {
     const st = stateFromElements(a, 0, i, lan, 0, th, mu);
     x = center.x + st.x;
     y = center.y + st.y;
@@ -146,7 +163,7 @@ function asteroidBelt(count: number, rMin: number, rMax: number, seed = 7): Body
     const deg = rng(st) * 360;
     const ecc = 0.96 + rng(st) * 0.08;
     const g = 120 + Math.floor(rng(st) * 60);
-    out.push(orbiting(`小行星-${i + 1}`, a, 1e-12, 0.003, `rgb(${g},${g - 10},${g - 25})`, deg, 1, { ecc, ...TEST_PARTICLE }));
+    out.push(orbiting(`小行星-${i + 1}`, a, 1e-12, 0.003, `rgb(${g},${g - 10},${g - 25})`, deg, 1, { speedMultiplier: ecc, ...TEST_PARTICLE }));
   }
   return out;
 }
@@ -159,7 +176,7 @@ function kuiperBelt(count: number, rMin: number, rMax: number, seed = 21): BodyS
     const deg = rng(st) * 360;
     const ecc = 0.96 + rng(st) * 0.08;
     const g = 130 + Math.floor(rng(st) * 50);
-    out.push(orbiting(`柯伊伯-${i + 1}`, a, 1e-12, 0.003, `rgb(${g - 25},${g},${g + 25})`, deg, 1, { ecc, ...TEST_PARTICLE }));
+    out.push(orbiting(`柯伊伯-${i + 1}`, a, 1e-12, 0.003, `rgb(${g - 25},${g},${g + 25})`, deg, 1, { speedMultiplier: ecc, ...TEST_PARTICLE }));
   }
   return out;
 }
@@ -173,13 +190,13 @@ interface MoonDef {
   color: string;
   angle: number;
   retro?: boolean;
-  ecc?: number;
+  speedMultiplier?: number;
 }
 
 function moonsOf(planet: BodySpec, defs: MoonDef[]): BodySpec[] {
   const center = { x: planet.x, y: planet.y, z: planet.z ?? 0, vx: planet.vx, vy: planet.vy, vz: planet.vz ?? 0 };
   return defs.map((m) =>
-    orbiting(m.name, m.a, m.mass, m.radius, m.color, m.angle, planet.mass, { key: m.key, ecc: m.ecc, retro: m.retro }, center),
+    orbiting(m.name, m.a, m.mass, m.radius, m.color, m.angle, planet.mass, { key: m.key, speedMultiplier: m.speedMultiplier, retro: m.retro }, center),
   );
 }
 
@@ -191,7 +208,7 @@ function innerSwarm(count: number, rMin: number, rMax: number, seed = 41): BodyS
     const deg = rng(st) * 360;
     const ecc = 0.96 + rng(st) * 0.08;
     const g = 150 + Math.floor(rng(st) * 50);
-    out.push(orbiting(`内圈小行星-${i + 1}`, a, 1e-12, 0.0015, `rgb(${g},${g - 20},${g - 60})`, deg, 1, { ecc, ...TEST_PARTICLE }));
+    out.push(orbiting(`内圈小行星-${i + 1}`, a, 1e-12, 0.0015, `rgb(${g},${g - 20},${g - 60})`, deg, 1, { speedMultiplier: ecc, ...TEST_PARTICLE }));
   }
   return out;
 }
@@ -203,7 +220,7 @@ function nearEarthSwarm(count: number, seed = 53): BodySpec[] {
     const a = 0.7 + 0.8 * rng(st);
     const deg = rng(st) * 360;
     const ecc = 0.9 + rng(st) * 0.2;
-    out.push(orbiting(`近地小行星-${i + 1}`, a, 1e-12, 0.0015, '#d6c9a8', deg, 1, { ecc, ...TEST_PARTICLE }));
+    out.push(orbiting(`近地小行星-${i + 1}`, a, 1e-12, 0.0015, '#d6c9a8', deg, 1, { speedMultiplier: ecc, ...TEST_PARTICLE }));
   }
   return out;
 }
@@ -219,7 +236,7 @@ function trojans(jupiterAngleDeg: number, jupiterA: number, countPerCamp: number
       const deg = base + (rng(st) - 0.5) * 28;
       const ecc = 0.96 + rng(st) * 0.08;
       const g = 140 + Math.floor(rng(st) * 50);
-      out.push(orbiting(`特洛伊-${camp}-${i + 1}`, a, 1e-12, 0.0025, `rgb(${g},${g - 15},${g - 40})`, deg, 1, { ecc, ...TEST_PARTICLE }));
+      out.push(orbiting(`特洛伊-${camp}-${i + 1}`, a, 1e-12, 0.0025, `rgb(${g},${g - 15},${g - 40})`, deg, 1, { speedMultiplier: ecc, ...TEST_PARTICLE }));
     }
   }
   return out;
@@ -250,7 +267,7 @@ function accretionDisk(
     const a = rMin + (rMax - rMin) * Math.sqrt(rng(st));
     const deg = rng(st) * 360;
     const ecc = 0.99 + rng(st) * 0.02;
-    out.push(orbiting(`吸积流-${i + 1}`, a, 1e-13, 0.0012, palette[Math.floor(rng(st) * palette.length)], deg, M, { ecc, ...TEST_PARTICLE }, center));
+    out.push(orbiting(`吸积流-${i + 1}`, a, 1e-13, 0.0012, palette[Math.floor(rng(st) * palette.length)], deg, M, { speedMultiplier: ecc, ...TEST_PARTICLE }, center));
   }
   return out;
 }
@@ -264,7 +281,7 @@ function grandBodies(): BodySpec[] {
   const saturn = orbiting('土星', 9.537, 2.86e-4, 0.0034, '#e6d3a3', 200, 1, { key: 'saturn', ring: true });
   const uranus = orbiting('天王星', 19.19, 4.37e-5, 0.0018, '#9fe0e8', 80, 1, { key: 'uranus' });
   const neptune = orbiting('海王星', 30.07, 5.15e-5, 0.0017, '#4b6fe0', 160, 1, { key: 'neptune' });
-  const pluto = orbiting('冥王星', 39.5, 6.5e-9, 0.00009, '#c9b8a8', 10, 1, { key: 'pluto', ecc: 0.85 });
+  const pluto = orbiting('冥王星', 39.5, 6.5e-9, 0.00009, '#c9b8a8', 10, 1, { key: 'pluto', speedMultiplier: 0.85 });
   const moons: BodySpec[] = [
     ...moonsOf(earth, [{ name: '月球', key: 'moon', a: 0.0028, mass: 3.69e-8, radius: 0.00014, color: '#d9d9d9', angle: 60 }]),
     ...moonsOf(mars, [
@@ -299,8 +316,8 @@ function grandBodies(): BodySpec[] {
   ];
   return balance([
     { ...SUN }, mercury, venus, earth, mars, jupiter, saturn, uranus, neptune, pluto,
-    orbiting('阋神星', 45, 8e-9, 0.00008, '#e8e4da', 250, 1, { key: 'eris', ecc: 1.1 }),
-    orbiting('妊神星', 43.1, 2e-9, 0.00008, '#dfe9ec', 320, 1, { key: 'haumea', ecc: 0.95 }),
+    orbiting('阋神星', 45, 8e-9, 0.00008, '#e8e4da', 250, 1, { key: 'eris', speedMultiplier: 1.1 }),
+    orbiting('妊神星', 43.1, 2e-9, 0.00008, '#dfe9ec', 320, 1, { key: 'haumea', speedMultiplier: 0.95 }),
     orbiting('鸟神星', 45.5, 1.5e-9, 0.00007, '#d9c8b8', 140, 1, { key: 'makemake' }),
     ...moons, ...innerSwarm(14, 0.09, 0.2), ...nearEarthSwarm(24), ...asteroidBelt(170, 2.06, 3.27),
     ...trojans(300, 5.203, 18), ...kuiperBelt(130, 30, 50),
@@ -310,6 +327,7 @@ function grandBodies(): BodySpec[] {
 export const PRESETS: Preset[] = [
   {
     id: 'solar',
+    physicalFidelity: 'physical-approximation',
     name: '太阳系',
     description: '太阳与八大行星，真实质量与物理半径；显示尺度由渲染器放大',
     viewRadius: 6.5,
@@ -322,6 +340,7 @@ export const PRESETS: Preset[] = [
   },
   {
     id: 'grand',
+    physicalFidelity: 'gameplay',
     name: '完整太阳系 · 内圈+外圈',
     description: '八大行星+20 颗卫星+小行星带/特洛伊/柯伊伯（碎块为 test particle）',
     viewRadius: 60,
@@ -332,6 +351,7 @@ export const PRESETS: Preset[] = [
   },
   {
     id: 'belt',
+    physicalFidelity: 'gameplay',
     name: '内太阳系 + 小行星带',
     description: '类地行星、木星与 160 颗 test-particle 小行星',
     viewRadius: 4,
@@ -344,6 +364,7 @@ export const PRESETS: Preset[] = [
   },
   {
     id: 'binary',
+    physicalFidelity: 'gameplay',
     name: '双星系统',
     description: '两颗恒星互相绕转，外围环双星行星',
     viewRadius: 6,
@@ -366,6 +387,7 @@ export const PRESETS: Preset[] = [
   },
   {
     id: 'three',
+    physicalFidelity: 'physical-model',
     name: '三体（8 字轨道）',
     description: '经典周期解——但任何扰动都会使其崩溃',
     viewRadius: 2.2,
@@ -383,6 +405,7 @@ export const PRESETS: Preset[] = [
   },
   {
     id: 'empty',
+    physicalFidelity: 'gameplay',
     name: '沙盒（仅太阳）',
     description: '从零开始构建你自己的星系',
     viewRadius: 4,
@@ -390,6 +413,7 @@ export const PRESETS: Preset[] = [
   },
   {
     id: 'kuiper',
+    physicalFidelity: 'gameplay',
     name: '外太阳系 + 柯伊伯带',
     description: '四颗巨行星、冥王星与阋神星,及 150 颗柯伊伯带 test particles',
     viewRadius: 55,
@@ -397,13 +421,14 @@ export const PRESETS: Preset[] = [
     bodies: balance([
       { ...SUN },
       PLANETS.jupiter(300), PLANETS.saturn(200), PLANETS.uranus(80), PLANETS.neptune(160),
-      orbiting('冥王星', 39.5, 6.5e-9, 0.008, '#c9b8a8', 10, 1, { key: 'pluto', ecc: 0.85 }),
-      orbiting('阋神星', 45, 8e-9, 0.007, '#e8e4da', 250, 1, { key: 'eris', ecc: 1.1 }),
+      orbiting('冥王星', 39.5, 6.5e-9, 0.008, '#c9b8a8', 10, 1, { key: 'pluto', speedMultiplier: 0.85 }),
+      orbiting('阋神星', 45, 8e-9, 0.007, '#e8e4da', 250, 1, { key: 'eris', speedMultiplier: 1.1 }),
       ...kuiperBelt(150, 30, 50),
     ]),
   },
   {
     id: 'jupiterMoons',
+    physicalFidelity: 'gameplay',
     name: '木星系',
     description: '木星与四颗伽利略卫星（轨道距离为观察用放大，物理半径为真实值）',
     viewRadius: 0.2,
@@ -419,6 +444,7 @@ export const PRESETS: Preset[] = [
   },
   {
     id: 'trappist',
+    physicalFidelity: 'gameplay',
     name: 'TRAPPIST-1',
     description: '0.09 倍太阳质量红矮星与 7 颗岩质行星（轨道按比例放大以便观察）',
     viewRadius: 0.4,
@@ -436,6 +462,7 @@ export const PRESETS: Preset[] = [
   },
   {
     id: 'blackhole',
+    physicalFidelity: 'physical-model',
     name: '黑洞 · 潮汐吸积',
     description: '12 倍太阳质量黑洞+吸积盘+3 颗伴星（视界=史瓦西半径，盘为 test particles）',
     viewRadius: 8,
@@ -449,7 +476,7 @@ export const PRESETS: Preset[] = [
         orbiting('伴星 S1', 3.0, 0.5, 0.055, '#ffd27a', 20, M, { key: 's1', isStar: true }, center),
         orbiting('伴星 S2', 5.5, 0.3, 0.045, '#8fd3ff', 200, M, { key: 's2', isStar: true }, center),
         orbiting('伴星 S3', 9.0, 0.2, 0.04, '#ff9d7a', 110, M, { key: 's3', isStar: true }, center),
-        orbiting('遇难恒星', 1.2, 0.4, 0.05, '#fff59d', 300, M, { key: 'doomed', isStar: true, ecc: 0.25 }, center),
+        orbiting('遇难恒星', 1.2, 0.4, 0.05, '#fff59d', 300, M, { key: 'doomed', isStar: true, speedMultiplier: 0.25 }, center),
         ...accretionDisk(M, center, 150, 0.16, 0.95),
       ], 0);
     })(),
@@ -509,7 +536,7 @@ export function generateRandomSystem(seed: number): Preset {
       const deg = rnd() * 360;
       const ecc = 0.96 + rnd() * 0.08;
       const g = 120 + Math.floor(rnd() * 60);
-      bodies.push(orbiting(`小行星-${i + 1}`, ba, 1e-12, 0.004, `rgb(${g},${g - 10},${g - 25})`, deg, starMass, { ecc, ...TEST_PARTICLE }));
+      bodies.push(orbiting(`小行星-${i + 1}`, ba, 1e-12, 0.004, `rgb(${g},${g - 10},${g - 25})`, deg, starMass, { speedMultiplier: ecc, ...TEST_PARTICLE }));
     }
     outer = rMax;
   }
@@ -531,6 +558,7 @@ export function generateRandomSystem(seed: number): Preset {
   }
   return {
     id: 'random',
+    physicalFidelity: 'gameplay',
     name: `随机星系 #${seed}`,
     description: `随机生成的${binary ? '双星' : '单星'}系统(种子 ${seed},${nPlanets} 颗行星)`,
     viewRadius: outer * 1.3,

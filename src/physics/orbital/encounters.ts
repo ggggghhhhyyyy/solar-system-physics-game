@@ -1,3 +1,5 @@
+import { isMassiveBody, isTestParticle } from '../body/semantics.ts';
+import { SpatialHash3D } from '../spatial/hash3d.ts';
 import type { Body } from '../types.ts';
 import { pairRoche, type RocheKind } from './roche.ts';
 
@@ -21,6 +23,8 @@ export interface EncounterReport {
   rocheAU: number | null;
   insideRoche: boolean;
   tidalDisruption: boolean;
+  /** Always true for this model. UI must show LINEAR APPROX. */
+  linearApprox: true;
 }
 
 export function linearClosestApproach(
@@ -71,12 +75,20 @@ function pairReport(a: Body, b: Body, kind: RocheKind = 'fluid'): EncounterRepor
     rocheAU: roche?.limit ?? null,
     insideRoche,
     tidalDisruption: insideRoche && !!primaryIsBH && !secondaryIsBH,
+    linearApprox: true,
   };
 }
 
+function relevantForGlobal(b: Body): boolean {
+  return isMassiveBody(b) || !!b.userLaunched;
+}
+
 /**
- * Closest pair. If `selectedId` is set, closest other body to that one.
- * Otherwise the globally closest pair (any gravityMode).
+ * Closest pair.
+ *
+ * Selected mode: selected vs all relevant — O(N).
+ * Global mode: massive + user-launched only. Spatial hash when N is large.
+ * Never a 100k-tracer O(N²) sweep.
  */
 export function closestEncounter(bodies: Body[], selectedId: number | null): EncounterReport | null {
   if (bodies.length < 2) return null;
@@ -86,17 +98,65 @@ export function closestEncounter(bodies: Body[], selectedId: number | null): Enc
     let best: EncounterReport | null = null;
     for (const b of bodies) {
       if (b === sel) continue;
+      if (isTestParticle(sel) && isTestParticle(b) && !b.userLaunched && !sel.userLaunched) continue;
       const rep = pairReport(sel, b);
       if (!best || rep.separationAU < best.separationAU) best = rep;
     }
     return best;
   }
+
+  const candidates: Body[] = [];
+  const indexOf = new Map<number, number>();
+  for (const b of bodies) {
+    if (!relevantForGlobal(b)) continue;
+    indexOf.set(b.id, candidates.length);
+    candidates.push(b);
+  }
+  if (candidates.length < 2) return null;
+
+  if (candidates.length <= 64) {
+    let best: EncounterReport | null = null;
+    for (let i = 0; i < candidates.length; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        const rep = pairReport(candidates[i], candidates[j]);
+        if (!best || rep.separationAU < best.separationAU) best = rep;
+      }
+    }
+    return best;
+  }
+
+  let maxR = 0;
+  for (const b of candidates) {
+    const r = Math.max(b.collisionRadius, b.physicalRadius, 1e-4);
+    if (r > maxR) maxR = r;
+  }
+  const cell = Math.max(maxR * 8, 0.05);
+  const hash = new SpatialHash3D(cell);
+  for (let i = 0; i < candidates.length; i++) {
+    const b = candidates[i];
+    hash.insert(i, b.x, b.y, b.z);
+  }
   let best: EncounterReport | null = null;
-  for (let i = 0; i < bodies.length; i++) {
-    for (let j = i + 1; j < bodies.length; j++) {
-      const rep = pairReport(bodies[i], bodies[j]);
+  for (let i = 0; i < candidates.length; i++) {
+    const a = candidates[i];
+    const neigh = hash.queryCellNeighbors(a.x, a.y, a.z);
+    for (const j of neigh) {
+      if (j <= i) continue;
+      const rep = pairReport(a, candidates[j]);
       if (!best || rep.separationAU < best.separationAU) best = rep;
     }
   }
   return best;
+}
+
+/** Roche/TDE candidate: massive primary vs finite-size secondary. No tracer↔tracer. */
+export function isTideCandidate(a: Body, b: Body): boolean {
+  if (isTestParticle(a) && isTestParticle(b)) return false;
+  const primary = a.mass >= b.mass ? a : b;
+  const sat = primary === a ? b : a;
+  if (!isMassiveBody(primary)) return false;
+  if (!(sat.mass > 0) || sat.isBlackHole) return false;
+  if (!(sat.physicalRadius > 0)) return false;
+  if (isTestParticle(sat) && sat.noCollide && !sat.userLaunched) return false;
+  return true;
 }

@@ -20,7 +20,7 @@ import type { Body } from './physics/types';
 import { exportSnapshot, parseSnapshot, restoreSnapshot, serializeSnapshot } from './physics/snapshot';
 import { scientificProperties } from './physics/orbital/spheres';
 import { closestEncounter, type EncounterReport } from './physics/orbital/encounters';
-import { getRelativeState, type ReferenceFrame } from './physics/frames/referenceFrames';
+import { getRelativeState, resolveFrame, type ReferenceFrame } from './physics/frames/referenceFrames';
 import type { DriftReport } from './physics/diagnostics/conservation';
 import {
   ACHIEVEMENTS,
@@ -33,8 +33,11 @@ import {
   type Stats,
 } from './game/stats';
 import { loadSolarSystem } from './physics/ephemeris/loadSolarSystem';
-import { queryHorizonsStates } from './physics/ephemeris/horizons.functions';
+import { browserHorizonsFetcher } from './physics/ephemeris/horizonsClient';
 import { HORIZONS_CACHE_EPOCH } from './physics/ephemeris/horizonsCache';
+import ScienceHud from './components/ScienceHud';
+import type { EphemerisMode } from './physics/ephemeris/types';
+import type { PhysicalFidelity } from './physics/types';
 
 interface LogEntry {
   id: number;
@@ -82,11 +85,12 @@ export default function App() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [panelOpen, setPanelOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(true);
-  const [epochDate, setEpochDate] = useState(() => HORIZONS_CACHE_EPOCH.slice(0, 10));
+  const [epochDate, setEpochDate] = useState(() => HORIZONS_CACHE_EPOCH.calendar.slice(0, 10));
   const [includeSpacecraft, setIncludeSpacecraft] = useState(true);
   const [includeMoons, setIncludeMoons] = useState(true);
   const [ephLoading, setEphLoading] = useState(false);
   const [ephMeta, setEphMeta] = useState<EphemerisMeta | null>(null);
+  const [fidelity, setFidelity] = useState<PhysicalFidelity>(PRESETS[0].physicalFidelity ?? 'physical-approximation');
   const [encounter, setEncounter] = useState<EncounterReport | null>(null);
   const prevDoneRef = useRef<Set<string>>(new Set(loadDailyState(todayKey()).doneIds));
   const [stats, setStats] = useState<Stats>(() => loadStats());
@@ -211,7 +215,7 @@ export default function App() {
           setSelected(null);
           setSettings((p) => ({ ...p, selectedId: null, followId: p.followId === p.selectedId ? null : p.followId }));
         } else if (sel) {
-          const sun = engine.heaviest();
+          const sun = engine.getPrimaryStar() ?? engine.getDominantGravitySource();
           const follow = engine.getBody(s.followId);
           let relRef: Body | ReferenceFrame;
           if (s.referenceFrame === 'body-centric') {
@@ -302,13 +306,15 @@ export default function App() {
       if (!p) return;
       engine.dt = p.dt ?? 0.0002;
       engine.softening = p.softening ?? 0.003;
-      engine.reset(p.bodies.map((b) => ({ ...b })), { epoch: p.epoch ?? null });
+      engine.setConstants(p.constants ?? 'gaussian');
+      engine.reset(p.bodies.map((b) => ({ ...b })), { epoch: p.epoch ?? null, constants: p.constants ?? 'gaussian' });
       engine.adaptiveDt = false;
       update({ adaptiveDt: false });
       // 每日任务：只清进度不清完成，切场景不丢星星
       tracker.softReset();
       setPresetId(id);
       setEphMeta(null);
+      setFidelity(p.physicalFidelity ?? 'gameplay');
       setSelected(null);
       update({ selectedId: null, followId: null });
       canvasRef.current?.setView({ x: 0, y: 0 }, p.viewRadius);
@@ -319,7 +325,7 @@ export default function App() {
   );
 
   const handleLoadEphemeris = useCallback(
-    async (source: 'horizons' | 'keplerian') => {
+    async (source: EphemerisMode) => {
       if (ephLoading) return;
       setEphLoading(true);
       update({ running: false });
@@ -328,26 +334,28 @@ export default function App() {
           epoch: epochDate,
           includeSpacecraft,
           includeMoons,
-          source: source === 'keplerian' ? 'keplerian' : 'auto',
-          fetchStates:
-            source === 'keplerian'
-              ? undefined
-              : async (req) => queryHorizonsStates({ data: req }),
+          source,
+          fetchStates: source === 'keplerian' ? undefined : browserHorizonsFetcher(),
         });
         engine.dt = loaded.dt;
         engine.softening = loaded.softening;
         engine.gMultiplier = 1;
         engine.adaptiveDt = true;
+        engine.setConstants(loaded.constants);
         setGMultiplier(1);
         update({ adaptiveDt: true, showRoche: true });
-        engine.reset(loaded.bodies.map((b) => ({ ...b })), { epoch: loaded.epoch });
+        engine.reset(loaded.bodies.map((b) => ({ ...b })), { epoch: loaded.epoch, constants: loaded.constants });
         tracker.softReset();
         prevTimeRef.current = engine.time;
         setPresetId('nasa-jpl');
+        const fid: PhysicalFidelity = loaded.source === 'keplerian' || loaded.fallback ? 'physical-approximation' : 'real-ephemeris';
+        setFidelity(fid);
         setEphMeta({
           source: loaded.source,
           timeScale: loaded.timeScale,
           label: `${loaded.center} · ${loaded.referenceFrame}`,
+          fallback: loaded.fallback,
+          fidelity: fid,
         });
         setSelected(null);
         update({ selectedId: null, followId: null, running: false });
@@ -355,9 +363,10 @@ export default function App() {
         setMissions(tracker.update(engine));
         setSimTime(engine.time);
         setBodyCount(engine.bodies.length);
-        const src = describeEphemerisSource(loaded.source);
-        pushLog(`已加载真实太阳系 · ${src} · ${loaded.epoch.slice(0, 10)} ${loaded.timeScale}`, 'success');
-        for (const w of loaded.warnings.slice(0, 3)) pushLog(w, 'info');
+        const src = describeEphemerisSource(loaded.source, loaded.fallback);
+        const cal = loaded.epoch ? `${loaded.epoch.jd.toFixed(5)} ${loaded.epoch.scale}` : epochDate;
+        pushLog(`已加载真实太阳系 · ${src} · JD ${cal}`, loaded.fallback ? 'warn' : 'success');
+        for (const w of loaded.warnings.slice(0, 4)) pushLog(w, loaded.fallback ? 'warn' : 'info');
       } catch (err) {
         pushLog(`星历加载失败：${err instanceof Error ? err.message : 'error'}`, 'warn');
       } finally {
@@ -401,7 +410,7 @@ export default function App() {
 
   const handleEvent = useCallback(
     (kind: 'rogue' | 'rogueBH' | 'shower' | 'comet' | 'clearUser' | 'clearTrails') => {
-      const sun = engine.heaviest();
+      const sun = engine.getPrimaryStar() ?? engine.getDominantGravitySource();
       const c = sun ? { x: sun.x, y: sun.y } : { x: 0, y: 0 };
       switch (kind) {
         case 'rogue': {
@@ -521,7 +530,7 @@ export default function App() {
         setSettings((s) => {
           if (s.selectedId != null) {
             const b = engine.getBody(s.selectedId);
-            if (b && b !== engine.heaviest()) engine.removeBody(s.selectedId);
+            if (b && b !== engine.getHeaviestMassiveBody()) engine.removeBody(s.selectedId);
           }
           return s;
         });
@@ -559,7 +568,7 @@ export default function App() {
               <span className="text-amber-300">☀</span> 太阳系物理引擎
             </div>
             <div className="font-mono text-[11px] text-cyan-200/90">
-              {formatSimClock(engine.epoch, simTime, engine.simulationDate, ephMeta?.timeScale ?? 'UTC')}
+              {formatSimClock(engine.epoch, simTime)}
             </div>
             <div className="font-mono text-[10px] text-slate-500">
               {formatTime(simTime)}
@@ -701,6 +710,22 @@ export default function App() {
 
       {/* Bottom-left: body card + logs + help + diagnostics */}
       <div className="pointer-events-none absolute bottom-3 left-3 flex flex-col items-start gap-2">
+          {settings.uiMode === 'science' && (
+            <ScienceHud
+              epoch={engine.epoch}
+              elapsedYears={simTime}
+              source={ephMeta?.source ?? 'preset'}
+              fallback={!!ephMeta?.fallback}
+              frame={resolveFrame(engine.bodies, settings.referenceFrame, settings.followId ?? settings.selectedId)}
+              integrator={engine.integrator.name}
+              adaptiveDt={engine.adaptiveDt}
+              dt={engine.dt}
+              softening={engine.softening}
+              constants={engine.constants}
+              drift={drift}
+              fidelity={ephMeta?.fidelity ?? fidelity}
+            />
+          )}
           <DiagnosticsPanel
             report={settings.uiMode === 'science' ? drift : null}
             encounter={settings.uiMode === 'science' ? encounter : null}

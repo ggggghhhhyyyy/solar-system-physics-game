@@ -1,5 +1,7 @@
-import type { Engine } from './engine.ts';
+import type { ConstantsSet } from './constants.ts';
 import { resolveRadii } from './engine.ts';
+import type { Engine } from './engine.ts';
+import { coerceEpoch, isEpoch, type Epoch, type TimeScale } from './time/epoch.ts';
 import type { BodySpec, GravityMode } from './types.ts';
 
 export type SnapshotBody = BodySpec & { age: number };
@@ -37,7 +39,14 @@ interface SnapshotV1 {
 interface SnapshotV2 {
   version: 2;
   time: number;
-  epoch: string | null;
+  epoch: Epoch | string | null;
+  timeScale?: TimeScale;
+  constants?: ConstantsSet;
+  dt?: number;
+  softening?: number;
+  adaptiveDt?: boolean;
+  integrator?: string;
+  gMultiplier?: number;
   bodies: SnapshotBody[];
 }
 
@@ -46,6 +55,13 @@ export function exportSnapshot(engine: Engine): SnapshotV2 {
     version: 2,
     time: engine.time,
     epoch: engine.epoch,
+    timeScale: engine.epoch?.scale,
+    constants: engine.constants.id,
+    dt: engine.dt,
+    softening: engine.softening,
+    adaptiveDt: engine.adaptiveDt,
+    integrator: engine.integrator.name,
+    gMultiplier: engine.gMultiplier,
     bodies: engine.bodies.map((b) => ({
       name: b.name,
       key: b.key,
@@ -78,9 +94,19 @@ export function exportSnapshot(engine: Engine): SnapshotV2 {
  * display radii as real sizes). Simulation time and body ages are restored.
  */
 export function restoreSnapshot(engine: Engine, data: SnapshotJSON): void {
-  const epoch = data.version === 2 ? data.epoch : engine.epoch;
+  let epoch: Epoch | null = engine.epoch;
+  if (data.version === 2) {
+    if (data.epoch == null) epoch = null;
+    else if (isEpoch(data.epoch)) epoch = { jd: data.epoch.jd, scale: data.epoch.scale };
+    else epoch = coerceEpoch(data.epoch, data.timeScale ?? 'UTC');
+    if (data.constants) engine.setConstants(data.constants);
+    if (typeof data.dt === 'number' && data.dt > 0) engine.dt = data.dt;
+    if (typeof data.softening === 'number') engine.softening = data.softening;
+    if (typeof data.adaptiveDt === 'boolean') engine.adaptiveDt = data.adaptiveDt;
+    if (typeof data.gMultiplier === 'number') engine.gMultiplier = data.gMultiplier;
+  }
   const specs: BodySpec[] = data.bodies.map((b) => migrateBody(b, data.version));
-  engine.reset(specs, { epoch: epoch ?? null });
+  engine.reset(specs, { epoch });
   engine.time = data.time;
   for (let i = 0; i < engine.bodies.length; i++) {
     const age = data.bodies[i]?.age;
@@ -184,8 +210,24 @@ export function parseSnapshot(raw: string): SnapshotJSON | null {
     if (version === 1) {
       return { version: 1, time: o['time'] as number, bodies: bodies as SnapshotV1['bodies'] };
     }
-    const epoch = o['epoch'] == null ? null : typeof o['epoch'] === 'string' ? o['epoch'] : null;
-    return { version: 2, time: o['time'] as number, epoch, bodies: bodies as SnapshotBody[] };
+    const epochRaw = o['epoch'];
+    let epoch: Epoch | string | null = null;
+    if (epochRaw == null) epoch = null;
+    else if (isEpoch(epochRaw)) epoch = epochRaw;
+    else if (typeof epochRaw === 'string') epoch = epochRaw;
+    return {
+      version: 2,
+      time: o['time'] as number,
+      epoch,
+      timeScale: o['timeScale'] === 'TDB' || o['timeScale'] === 'TT' || o['timeScale'] === 'UTC' ? o['timeScale'] : undefined,
+      constants: o['constants'] === 'de440' || o['constants'] === 'gaussian' ? o['constants'] : undefined,
+      dt: isFiniteNum(o['dt']) ? o['dt'] : undefined,
+      softening: isFiniteNum(o['softening']) ? o['softening'] : undefined,
+      adaptiveDt: typeof o['adaptiveDt'] === 'boolean' ? o['adaptiveDt'] : undefined,
+      integrator: typeof o['integrator'] === 'string' ? o['integrator'] : undefined,
+      gMultiplier: isFiniteNum(o['gMultiplier']) ? o['gMultiplier'] : undefined,
+      bodies: bodies as SnapshotBody[],
+    };
   } catch {
     return null;
   }

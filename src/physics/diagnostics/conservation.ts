@@ -1,3 +1,4 @@
+import { isMassiveBody } from '../body/semantics.ts';
 import type { Body } from '../types.ts';
 
 export interface ConservationSnapshot {
@@ -62,7 +63,7 @@ export function driftLevel(
  * so including them would make E/P/L appear to drift). PHYSICAL MODEL.
  */
 export function computeConservation(bodies: readonly Body[], G: number, softening: number): ConservationSnapshot {
-  const massive = bodies.filter((b) => b.gravityMode !== 'test-particle' && b.mass > 0);
+  const massive = bodies.filter(isMassiveBody);
   const n = massive.length;
   const eps2 = softening * softening;
 

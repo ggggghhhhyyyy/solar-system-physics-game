@@ -1,8 +1,21 @@
+import type { ConstantsSet } from './constants.ts';
+import type { Epoch, TimeScale } from './time/epoch.ts';
+
 export type GravityMode = 'massive' | 'test-particle';
 
 export type UiMode = 'game' | 'science';
 
 export type ReferenceFrameKind = 'barycentric' | 'heliocentric' | 'body-centric';
+
+/**
+ * How close a preset is to real solar-system dynamics.
+ * SCIENCE UI must surface this. Never hide a gameplay orbit as ephemeris.
+ */
+export type PhysicalFidelity =
+  | 'real-ephemeris'
+  | 'physical-approximation'
+  | 'physical-model'
+  | 'gameplay';
 
 /**
  * BodySpec is the serialisable / authoring form of a body.
@@ -95,8 +108,10 @@ export interface Preset {
   bodies: BodySpec[];
   dt?: number;
   softening?: number;
-  /** ISO-8601 epoch. If set, UI shows a simulation calendar date. */
+  /** Game-preset clock. UTC civil instant, never a TDB instant with a Z suffix. */
   epoch?: string | null;
+  physicalFidelity?: PhysicalFidelity;
+  constants?: ConstantsSet;
 }
 
 export interface IntegratorWorld {
@@ -109,3 +124,5 @@ export interface Integrator {
   readonly name: string;
   step(world: IntegratorWorld): void;
 }
+
+export type { Epoch, TimeScale, ConstantsSet };

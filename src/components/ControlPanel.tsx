@@ -1,8 +1,8 @@
 import { LAUNCH_TYPES, PRESETS } from '../physics/presets';
 import type { Settings } from '../game/settings';
 import type { MissionState } from '../game/missions';
-import type { ReferenceFrameKind, UiMode } from '../physics/types';
-import type { EphemerisSource, TimeScale } from '../physics/ephemeris/types';
+import type { PhysicalFidelity, ReferenceFrameKind, UiMode } from '../physics/types';
+import type { EphemerisMode, EphemerisSource, TimeScale } from '../physics/ephemeris/types';
 import { Btn, Panel, SectionTitle, Toggle } from './ui';
 import { cn } from '../utils/cn';
 
@@ -19,12 +19,23 @@ export interface EphemerisMeta {
   source: EphemerisSource;
   timeScale: TimeScale;
   label: string;
+  fallback?: boolean;
+  fidelity?: PhysicalFidelity;
 }
 
-export function describeEphemerisSource(source: EphemerisSource): string {
+export function describeEphemerisSource(source: EphemerisSource, fallback = false): string {
+  if (fallback) return 'SOURCE: KEPLERIAN FALLBACK';
   if (source === 'horizons-cache') return 'JPL Horizons DE441 缓存';
   if (source === 'horizons-live') return 'JPL Horizons 实时';
-  return 'JPL 开普勒近似';
+  return 'PHYSICAL APPROXIMATION · JPL 开普勒近似';
+}
+
+function fidelityBadge(f: PhysicalFidelity | undefined): string | null {
+  if (!f) return null;
+  if (f === 'real-ephemeris') return 'REAL EPHEMERIS';
+  if (f === 'physical-approximation') return 'APPROXIMATION';
+  if (f === 'physical-model') return 'PHYSICAL MODEL';
+  return 'GAMEPLAY';
 }
 
 interface Props {
@@ -55,7 +66,7 @@ interface Props {
   onIncludeMoons: (v: boolean) => void;
   ephemerisLoading: boolean;
   ephemerisMeta: EphemerisMeta | null;
-  onLoadEphemeris: (source: 'horizons' | 'keplerian') => void;
+  onLoadEphemeris: (source: EphemerisMode) => void;
 }
 
 export default function ControlPanel({
@@ -128,6 +139,11 @@ export default function ControlPanel({
               >
                 <div className="text-xs font-medium text-slate-100">{p.name}</div>
                 <div className="text-[10px] text-slate-400">{p.description}</div>
+                {fidelityBadge(p.physicalFidelity) && (
+                  <div className="mt-1 text-[9px] uppercase tracking-wide text-amber-200/80">
+                    {fidelityBadge(p.physicalFidelity)}
+                  </div>
+                )}
               </button>
             ))}
             <button
@@ -187,28 +203,42 @@ export default function ControlPanel({
             checked={includeMoons}
             onChange={onIncludeMoons}
           />
-          <div className="mt-2 grid grid-cols-2 gap-1.5">
+          <div className="mt-2 grid grid-cols-3 gap-1.5">
             <Btn
               disabled={ephemerisLoading}
               onClick={() => onLoadEphemeris('horizons')}
-              className="border-amber-400/40 bg-amber-500/10 text-amber-100 hover:bg-amber-500/20"
+              className="border-amber-400/40 bg-amber-500/10 px-1 text-[10px] text-amber-100 hover:bg-amber-500/20"
             >
               {ephemerisLoading ? '查询中…' : 'Horizons'}
             </Btn>
-            <Btn disabled={ephemerisLoading} onClick={() => onLoadEphemeris('keplerian')}>
-              开普勒近似
+            <Btn
+              disabled={ephemerisLoading}
+              onClick={() => onLoadEphemeris('auto')}
+              className="px-1 text-[10px]"
+            >
+              Auto
+            </Btn>
+            <Btn disabled={ephemerisLoading} onClick={() => onLoadEphemeris('keplerian')} className="px-1 text-[10px]">
+              开普勒
             </Btn>
           </div>
           {ephemerisMeta && (
             <div className="mt-2 rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-[10px] leading-relaxed text-slate-300">
               <div className="font-mono text-cyan-200">
-                {describeEphemerisSource(ephemerisMeta.source)} · {ephemerisMeta.timeScale}
+                {describeEphemerisSource(ephemerisMeta.source, ephemerisMeta.fallback)} · {ephemerisMeta.timeScale}
               </div>
+              {ephemerisMeta.fallback && (
+                <div className="mt-0.5 font-semibold text-amber-200">SOURCE: KEPLERIAN FALLBACK</div>
+              )}
+              {ephemerisMeta.source === 'keplerian' && (
+                <div className="mt-0.5 font-semibold text-amber-200">PHYSICAL APPROXIMATION</div>
+              )}
               <div className="mt-0.5 text-slate-400">{ephemerisMeta.label}</div>
             </div>
           )}
           <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
-            2026-09-11 走烘焙 DE441 缓存，瞬间加载。其它历元请求 JPL Horizons；失败则回落到两体开普勒近似（无月球、无探测器）。卫星距离是真值：跟随木星并放大才能分开伽利略四卫。
+            Horizons 只走缓存或我们的服务端代理，失败就报错，绝不偷偷回落。Auto 允许
+            缓存 → 实时 → 开普勒，并显示 SOURCE: KEPLERIAN FALLBACK。开普勒是两体近似（无月球、无探测器）。
           </p>
         </section>
 
@@ -287,7 +317,7 @@ export default function ControlPanel({
             <Toggle label="Sphere of Influence" checked={settings.showSOI} onChange={(v) => update({ showSOI: v })} />
             <Toggle label="Lagrange L1–L5" checked={settings.showLagrange} onChange={(v) => update({ showLagrange: v })} />
             <Toggle label="Roche / TDE" checked={settings.showRoche} onChange={(v) => update({ showRoche: v })} />
-            <Toggle label="自适应 dt（交会加密）" checked={settings.adaptiveDt} onChange={(v) => update({ adaptiveDt: v })} />
+            <Toggle label="自适应子步（交会加密）" checked={settings.adaptiveDt} onChange={(v) => update({ adaptiveDt: v })} />
           </div>
         </section>
 
@@ -320,7 +350,7 @@ export default function ControlPanel({
             </div>
           )}
           <p className="mt-2 text-[10px] leading-relaxed text-slate-400">
-            GAME 保持沙盒体验。SCIENCE 显示状态矢量、六根数、守恒量与 Hill/SOI。两者共用同一物理引擎。
+            GAME 保持沙盒体验。SCIENCE 显示状态矢量、六根数、守恒量、时间尺度与近似徽章。参考系只改显示，不改积分。自适应是子步加密，不是自适应辛积分器。
           </p>
         </section>
 

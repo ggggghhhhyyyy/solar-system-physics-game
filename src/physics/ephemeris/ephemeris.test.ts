@@ -26,7 +26,7 @@ $$EOE
 
 describe('Phase 2 — Horizons parser', () => {
   it('parses AU-D geometric state and converts velocity to AU/year', () => {
-    const p = parseHorizonsVector(EARTH_FIXTURE, '2026-09-11T00:00:00Z');
+    const p = parseHorizonsVector(EARTH_FIXTURE, { jd: 2461294.5, scale: 'TDB' });
     assert.equal(p.timeScale, 'TDB');
     assert.equal(p.units, 'AU-D');
     assert.ok(Math.abs(p.state.position.x - 0.9832120976335644) < 1e-12);
@@ -39,7 +39,7 @@ describe('Phase 2 — Horizons parser', () => {
   });
 
   it('rejects missing $$SOE', () => {
-    assert.throws(() => parseHorizonsVector('no table here', '2026-01-01T00:00:00Z'));
+    assert.throws(() => parseHorizonsVector('no table here', { jd: 2451545, scale: 'TDB' }));
   });
 });
 
@@ -127,7 +127,7 @@ describe('Phase 2 — DE441 cache loader', () => {
 
   it('cached Earth matches the parser fixture', () => {
     const c = HORIZONS_CACHE_2026_09_11.earth;
-    const p = parseHorizonsVector(EARTH_FIXTURE, '2026-09-11T00:00:00Z');
+    const p = parseHorizonsVector(EARTH_FIXTURE, { jd: 2461294.5, scale: 'TDB' });
     assert.ok(Math.abs(c.x - p.state.position.x) < 1e-12);
     assert.ok(Math.abs(c.vx - p.state.velocity.x) < 1e-12);
   });

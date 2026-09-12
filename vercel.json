@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/horizons.ts": {
+      "maxDuration": 30
+    }
+  }
+}

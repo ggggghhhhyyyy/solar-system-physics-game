@@ -1,3 +1,4 @@
+import { isMassiveBody } from '../body/semantics.ts';
 import type { Body, ReferenceFrameKind, StateVector } from '../types.ts';
 
 export interface ReferenceFrame {
@@ -5,10 +6,13 @@ export interface ReferenceFrame {
   /** For body-centric, the reference body id. */
   bodyId?: number | null;
   label: string;
+  /** Set when the requested body-centric target is missing. */
+  fallback?: 'barycentric' | 'heliocentric';
+  note?: string;
 }
 
-export const BARYCENTRIC: ReferenceFrame = { kind: 'barycentric', label: 'Barycentric' };
-export const HELIOCENTRIC: ReferenceFrame = { kind: 'heliocentric', label: 'Heliocentric' };
+export const BARYCENTRIC: ReferenceFrame = { kind: 'barycentric', label: 'Barycentric (massive COM)' };
+export const HELIOCENTRIC: ReferenceFrame = { kind: 'heliocentric', label: 'Heliocentric (primary star)' };
 
 export function bodyCentric(body: Body): ReferenceFrame {
   return { kind: 'body-centric', bodyId: body.id, label: `${body.name}-centric` };
@@ -24,9 +28,11 @@ export interface FrameOrigin {
 }
 
 /**
- * System barycentre (mass-weighted). Test particles contribute if they have mass,
- * which they typically do at trace level; their effect is negligible.
+ * System barycentre of MASSIVE bodies only.
+ * Test particles — even a 100 M☉ probe — contribute nothing.
  * PHYSICAL MODEL. The engine never assumes the Sun sits at the origin.
+ *
+ * This is an analysis/display transform. It does not mutate engine state.
  */
 export function barycenter(bodies: readonly Body[]): FrameOrigin {
   let m = 0;
@@ -37,7 +43,7 @@ export function barycenter(bodies: readonly Body[]): FrameOrigin {
   let py = 0;
   let pz = 0;
   for (const b of bodies) {
-    if (!(b.mass > 0)) continue;
+    if (!isMassiveBody(b)) continue;
     m += b.mass;
     x += b.mass * b.x;
     y += b.mass * b.y;
@@ -50,22 +56,44 @@ export function barycenter(bodies: readonly Body[]): FrameOrigin {
   return { x: x / m, y: y / m, z: z / m, vx: px / m, vy: py / m, vz: pz / m };
 }
 
-export function heaviestStar(bodies: readonly Body[]): Body | undefined {
+/** Heaviest massive star that is not a black hole. */
+export function getPrimaryStar(bodies: readonly Body[]): Body | undefined {
   let best: Body | undefined;
   for (const b of bodies) {
-    if (b.isBlackHole) continue;
-    if (!b.isStar && b.mass < 0.05) continue;
+    if (!isMassiveBody(b)) continue;
+    if (!b.isStar || b.isBlackHole) continue;
     if (!best || b.mass > best.mass) best = b;
   }
-  if (best) return best;
-  for (const b of bodies) if (!best || b.mass > best.mass) best = b;
   return best;
+}
+
+export function getHeaviestMassiveBody(bodies: readonly Body[]): Body | undefined {
+  let best: Body | undefined;
+  for (const b of bodies) {
+    if (!isMassiveBody(b)) continue;
+    if (!best || b.mass > best.mass) best = b;
+  }
+  return best;
+}
+
+/** Star, black hole, or massive planet — never a test particle. */
+export function getDominantGravitySource(bodies: readonly Body[]): Body | undefined {
+  return getHeaviestMassiveBody(bodies);
+}
+
+export function getReferencePrimary(bodies: readonly Body[]): Body | undefined {
+  return getPrimaryStar(bodies) ?? getDominantGravitySource(bodies);
+}
+
+/** @deprecated Use getPrimaryStar / getHeaviestMassiveBody. */
+export function heaviestStar(bodies: readonly Body[]): Body | undefined {
+  return getReferencePrimary(bodies);
 }
 
 export function resolveOrigin(bodies: readonly Body[], frame: ReferenceFrame): FrameOrigin {
   if (frame.kind === 'barycentric') return barycenter(bodies);
   if (frame.kind === 'heliocentric') {
-    const star = heaviestStar(bodies);
+    const star = getPrimaryStar(bodies) ?? getDominantGravitySource(bodies);
     if (!star) return barycenter(bodies);
     return { x: star.x, y: star.y, z: star.z, vx: star.vx, vy: star.vy, vz: star.vz };
   }
@@ -75,9 +103,36 @@ export function resolveOrigin(bodies: readonly Body[], frame: ReferenceFrame): F
   return { x: b.x, y: b.y, z: b.z, vx: b.vx, vy: b.vy, vz: b.vz };
 }
 
+export function resolveFrame(
+  bodies: readonly Body[],
+  kind: ReferenceFrameKind,
+  bodyId?: number | null,
+): ReferenceFrame {
+  if (kind === 'barycentric') return { ...BARYCENTRIC };
+  if (kind === 'heliocentric') {
+    const star = getPrimaryStar(bodies);
+    if (star) return { ...HELIOCENTRIC, bodyId: star.id, label: `${star.name}-centric (heliocentric)` };
+    const fallback = getDominantGravitySource(bodies);
+    return {
+      kind: 'heliocentric',
+      bodyId: fallback?.id,
+      label: fallback ? `${fallback.name}-centric (no star)` : 'Heliocentric',
+      fallback: 'barycentric',
+      note: star ? undefined : 'No primary star; using dominant massive body.',
+    };
+  }
+  const b = bodyId == null ? undefined : bodies.find((x) => x.id === bodyId);
+  if (b) return bodyCentric(b);
+  return {
+    ...BARYCENTRIC,
+    fallback: 'barycentric',
+    note: 'Body-centric target missing; fell back to massive-body barycentre.',
+  };
+}
+
 /**
- * State of `body` relative to a reference. The reference may be another body,
- * the system barycentre, or the heaviest star (heliocentric).
+ * State of `body` relative to a reference.
+ * DISPLAY / ANALYSIS transform — does not write back into Engine.
  */
 export function getRelativeState(
   body: Body,

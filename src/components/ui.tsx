@@ -101,10 +101,11 @@ export function formatTime(years: number): string {
   return `第 ${y} 年 第 ${d} 天`;
 }
 
-export function formatSimClock(epoch: string | null, years: number, date: Date | null, timeScale: 'TDB' | 'UTC' = 'UTC'): string {
-  if (epoch && date) {
-    const iso = date.toISOString().replace('T', ' ').slice(0, 16);
-    return `SIM DATE  ${iso} ${timeScale}`;
-  }
-  return `T + ${years.toFixed(3)} years`;
+import type { Epoch } from '../physics/time/epoch';
+import { formatEpoch } from '../physics/time/epoch';
+
+export function formatSimClock(epoch: Epoch | null, years: number): string {
+  if (!epoch) return `T + ${years.toFixed(3)} years`;
+  const fmt = formatEpoch(epoch, years);
+  return `SIM ${fmt.calendar} ${fmt.scale}  JD ${fmt.jd.toFixed(5)}`;
 }

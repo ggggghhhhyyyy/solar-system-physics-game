@@ -14,6 +14,8 @@ import { screenRadiusAU, screenRadiusPx } from '../rendering/visualScale';
 import { calculateLagrangePoints } from '../physics/orbital/lagrange';
 import { scientificProperties } from '../physics/orbital/spheres';
 import { rocheLimitAU } from '../physics/orbital/roche';
+import { sampleOsculatingOrbit } from '../physics/orbital/orbitPath';
+import { xyProjection } from '../rendering/projection';
 
 export interface CanvasHandle {
   setView: (center: { x: number; y: number }, radius: number) => void;
@@ -237,7 +239,7 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
     }
 
     const bodies = engine.bodies;
-    const sun = engine.heaviest();
+    const sun = engine.getPrimaryStar() ?? engine.getDominantGravitySource();
     // 光照源:优先最重的恒星(黑洞不发光,只有吸积盘辉光);无恒星时回退到最重天体
     let light: Body | undefined;
     for (const b of bodies) {
@@ -279,45 +281,24 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
       }
     }
 
-    // 选中天体束缚椭圆轨道叠加(世界坐标直接画,线宽固定1)
+    // 选中天体：真实 3D osculating orbit 的 xy 投影，不是二维重新拟合
     {
       const sel = s.selectedId != null ? engine.getBody(s.selectedId) : undefined;
-      const ref = engine.heaviest();
+      const ref = engine.getReferencePrimary() ?? engine.getDominantGravitySource();
       if (sel && ref && sel !== ref) {
         const el = engine.orbitalElements(sel, ref);
         if (!el.unbound && el.a != null && el.a > 0 && el.a < 1e6 && el.e < 0.999) {
-          const rx = sel.x - ref.x;
-          const ry = sel.y - ref.y;
-          const rvx = sel.vx - ref.vx;
-          const rvy = sel.vy - ref.vy;
           const mu = engine.G * (ref.mass + sel.mass);
-          const r = Math.hypot(rx, ry);
-          if (r > 1e-9 && mu > 0) {
-            const v2 = rvx * rvx + rvy * rvy;
-            const rdotv = rx * rvx + ry * rvy;
-            const ex = ((v2 - mu / r) * rx - rdotv * rvx) / mu;
-            const ey = ((v2 - mu / r) * ry - rdotv * rvy) / mu;
-            let omega = Math.atan2(ey, ex);
-            if (!Number.isFinite(omega) || Math.hypot(ex, ey) < 1e-8) omega = 0;
-            const cosO = Math.cos(omega);
-            const sinO = Math.sin(omega);
-            const e = el.e;
-            const a = el.a;
-            const p = a * (1 - e * e);
+          const path = sampleOsculatingOrbit(el, mu, { x: ref.x, y: ref.y, z: ref.z }, 160);
+          if (path.points.length > 2) {
+            const proj = xyProjection(toScreen);
             ctx.strokeStyle = 'rgba(103, 232, 249, 0.4)';
             ctx.lineWidth = 1;
             ctx.beginPath();
-            const SEG = 128;
-            for (let k = 0; k <= SEG; k++) {
-              const nu = (k / SEG) * Math.PI * 2;
-              const rr = p / Math.max(1e-9, 1 + e * Math.cos(nu));
-              const ox = rr * Math.cos(nu);
-              const oy = rr * Math.sin(nu);
-              const wx = ref.x + ox * cosO - oy * sinO;
-              const wy = ref.y + ox * sinO + oy * cosO;
-              const [sx, sy] = toScreen(wx, wy);
-              if (k === 0) ctx.moveTo(sx, sy);
-              else ctx.lineTo(sx, sy);
+            for (let k = 0; k < path.points.length; k++) {
+              const sp = proj.project(path.points[k]);
+              if (k === 0) ctx.moveTo(sp.x, sp.y);
+              else ctx.lineTo(sp.x, sp.y);
             }
             ctx.stroke();
           }
@@ -506,7 +487,7 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
     // Hill sphere / SOI overlays. VISUALIZATION ONLY — not physics.
     {
       const sel = s.selectedId != null ? engine.getBody(s.selectedId) : undefined;
-      const parent = engine.heaviest();
+      const parent = engine.getReferencePrimary() ?? engine.getDominantGravitySource();
       if (sel && parent && sel !== parent) {
         const props = scientificProperties(sel, parent, engine.G);
         const drawRing = (radiusAU: number | null, color: string, dash: number[]) => {
@@ -547,10 +528,10 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
 
     // Lagrange L1–L5 via CRTBP solver (not Hill-radius approximation).
     // VISUALIZATION ONLY. Toggle-controlled. Selected body becomes the secondary
-    // when it is a valid CRTBP companion; otherwise the two heaviest bodies.
+    // when it is a valid CRTBP companion; otherwise the two heaviest massive bodies.
     if (s.showLagrange && bodies.length >= 2) {
       const sel = s.selectedId != null ? engine.getBody(s.selectedId) : undefined;
-      let m1: Body | undefined = engine.heaviest();
+      let m1: Body | undefined = engine.getDominantGravitySource();
       let m2: Body | undefined = sel && sel !== m1 ? sel : undefined;
       if (!m2) {
         for (const b of bodies) {
