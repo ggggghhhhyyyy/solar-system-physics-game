@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import SimulationCanvas, { type CanvasHandle } from './components/SimulationCanvas';
-import ControlPanel from './components/ControlPanel';
+import ControlPanel, { describeEphemerisSource, type EphemerisMeta } from './components/ControlPanel';
 import BodyCard, { type BodySnapshot } from './components/BodyCard';
-import { Btn, Panel, formatTime } from './components/ui';
+import DiagnosticsPanel from './components/DiagnosticsPanel';
+import { Btn, Panel, formatSimClock, formatTime } from './components/ui';
 import { Engine } from './physics/engine';
 import { PRESETS, asteroidShower, generateRandomSystem, longPeriodComet, rogueBlackHole, rogueStar } from './physics/presets';
 import { MissionTracker, type MissionDef, type MissionState } from './game/missions';
@@ -17,6 +18,10 @@ import { MissionCelebration } from './components/MissionCelebration';
 import { DEFAULT_SETTINGS, SPEED_STEPS, type Settings } from './game/settings';
 import type { Body } from './physics/types';
 import { exportSnapshot, parseSnapshot, restoreSnapshot, serializeSnapshot } from './physics/snapshot';
+import { scientificProperties } from './physics/orbital/spheres';
+import { closestEncounter, type EncounterReport } from './physics/orbital/encounters';
+import { getRelativeState, type ReferenceFrame } from './physics/frames/referenceFrames';
+import type { DriftReport } from './physics/diagnostics/conservation';
 import {
   ACHIEVEMENTS,
   loadStats,
@@ -27,6 +32,9 @@ import {
   recordTick,
   type Stats,
 } from './game/stats';
+import { loadSolarSystem } from './physics/ephemeris/loadSolarSystem';
+import { queryHorizonsStates } from './physics/ephemeris/horizons.functions';
+import { HORIZONS_CACHE_EPOCH } from './physics/ephemeris/horizonsCache';
 
 interface LogEntry {
   id: number;
@@ -39,7 +47,8 @@ let logId = 0;
 export default function App() {
   const engine = useMemo(() => {
     const e = new Engine();
-    e.reset(PRESETS[0].bodies.map((b) => ({ ...b })));
+    const p = PRESETS[0];
+    e.reset(p.bodies.map((b) => ({ ...b })), { epoch: p.epoch ?? null });
     return e;
   }, []);
   const [dailyDate, setDailyDate] = useState(() => todayKey());
@@ -50,13 +59,14 @@ export default function App() {
   });
   const [rerollsLeft, setRerollsLeft] = useState(() => loadDailyState(todayKey()).rerollsLeft);
   const [celebration, setCelebration] = useState<MissionState | null>(null);
-  const [onboardStep, setOnboardStep] = useState<number | null>(() => {
+  const [onboardStep, setOnboardStep] = useState<number | null>(null);
+  useEffect(() => {
     try {
-      return localStorage.getItem('ssp1-onboarded') === '1' ? null : 0;
+      if (localStorage.getItem('ssp1-onboarded') !== '1') setOnboardStep(0);
     } catch {
-      return 0;
+      setOnboardStep(0);
     }
-  });
+  }, []);
   const tracker = useMemo(() => new MissionTracker(dailyDefs), []);
   const canvasRef = useRef<CanvasHandle>(null);
 
@@ -65,12 +75,19 @@ export default function App() {
   const [gMultiplier, setGMultiplier] = useState(1);
   const [collisions, setCollisions] = useState(true);
   const [simTime, setSimTime] = useState(0);
+  const [drift, setDrift] = useState<DriftReport | null>(null);
   const [bodyCount, setBodyCount] = useState(engine.bodies.length);
   const [selected, setSelected] = useState<BodySnapshot | null>(null);
   const [missions, setMissions] = useState<MissionState[]>(() => tracker.update(engine));
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [panelOpen, setPanelOpen] = useState(true);
+  const [panelOpen, setPanelOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(true);
+  const [epochDate, setEpochDate] = useState(() => HORIZONS_CACHE_EPOCH.slice(0, 10));
+  const [includeSpacecraft, setIncludeSpacecraft] = useState(true);
+  const [includeMoons, setIncludeMoons] = useState(true);
+  const [ephLoading, setEphLoading] = useState(false);
+  const [ephMeta, setEphMeta] = useState<EphemerisMeta | null>(null);
+  const [encounter, setEncounter] = useState<EncounterReport | null>(null);
   const prevDoneRef = useRef<Set<string>>(new Set(loadDailyState(todayKey()).doneIds));
   const [stats, setStats] = useState<Stats>(() => loadStats());
   const prevTimeRef = useRef<number>(engine.time);
@@ -85,6 +102,10 @@ export default function App() {
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+
+  useEffect(() => {
+    engine.adaptiveDt = settings.adaptiveDt;
+  }, [engine, settings.adaptiveDt]);
 
   const pushLog = useCallback((text: string, kind: LogEntry['kind'] = 'info') => {
     const id = ++logId;
@@ -115,6 +136,10 @@ export default function App() {
                 important ? 'warn' : 'info',
               );
             }
+          } else if (e.type === 'roche' && e.primary && e.secondary) {
+            pushLog(`Roche：${e.secondary.name} 进入 ${e.primary.name} 的流体洛希极限`, 'warn');
+          } else if (e.type === 'tde' && e.primary && e.secondary) {
+            pushLog(`TDE：${e.secondary.name} 正在被 ${e.primary.name} 潮汐撕裂（检测，未做流体碎裂）`, 'warn');
           } else if (e.type === 'escaped' && e.body) {
             if (e.body.mass > 1e-8 || e.body.userLaunched) {
               pushLog(`${e.body.name} 已飞离星系`, 'info');
@@ -169,6 +194,8 @@ export default function App() {
       setMissions(ms);
       setSimTime(engine.time);
       setBodyCount(engine.bodies.length);
+      setDrift(engine.diagnostics());
+      setEncounter(closestEncounter(engine.bodies, settingsRef.current.selectedId));
       // 统计:用 engine.time 差值累加模拟年
       {
         const dt = engine.time - prevTimeRef.current;
@@ -185,65 +212,81 @@ export default function App() {
           setSettings((p) => ({ ...p, selectedId: null, followId: p.followId === p.selectedId ? null : p.followId }));
         } else if (sel) {
           const sun = engine.heaviest();
+          const follow = engine.getBody(s.followId);
+          let relRef: Body | ReferenceFrame;
+          if (s.referenceFrame === 'body-centric') {
+            if (follow && follow !== sel) relRef = follow;
+            else if (sun && sun !== sel) relRef = sun;
+            else relRef = { kind: 'barycentric', label: 'barycentric' };
+          } else {
+            relRef = { kind: s.referenceFrame, label: s.referenceFrame };
+          }
+          const rel = getRelativeState(sel, relRef, engine.bodies);
           let distToSun = 0;
           let energy = 0;
           let period: number | null = null;
-          let a: number | undefined;
+          let a: number | null | undefined;
           let e: number | undefined;
-          let rp: number | undefined;
-          let ra: number | undefined;
+          let i: number | undefined;
+          let Omega: number | undefined;
+          let omega: number | undefined;
+          let nu: number | undefined;
+          let rp: number | null | undefined;
+          let ra: number | null | undefined;
           let retrograde: boolean | undefined;
           let unbound: boolean | undefined;
+          let kind: BodySnapshot['kind'];
           if (sun && sun !== sel) {
-            distToSun = Math.hypot(sel.x - sun.x, sel.y - sun.y);
+            distToSun = Math.hypot(sel.x - sun.x, sel.y - sun.y, sel.z - sun.z);
             energy = engine.specificEnergy(sel, sun);
-            // 相对最重天体的角动量(标量 h = rx*vy - ry*vx)
-            const rx = sel.x - sun.x;
-            const ry = sel.y - sun.y;
-            const rvx = sel.vx - sun.vx;
-            const rvy = sel.vy - sun.vy;
-            const h = rx * rvy - ry * rvx;
-            retrograde = h < 0;
-            if (energy < 0) {
-              const mu = engine.G * (sun.mass + sel.mass);
-              a = -mu / (2 * energy);
-              e = Math.sqrt(Math.max(0, 1 + (2 * energy * h * h) / (mu * mu)));
-              if (!Number.isFinite(e)) e = 0;
-              // 钳制: e=0 圆轨道不 NaN(上已 max(0,..));数值误差致 e>=1 时钳到 0.999
-              e = Math.max(e, 0);
-              if (e >= 1) e = 0.999;
-              rp = a * (1 - e);
-              ra = a * (1 + e);
-              unbound = false;
-              period = 2 * Math.PI * Math.sqrt((a * a * a) / mu);
-            } else {
-              unbound = true;
-              a = undefined;
-              e = undefined;
-              rp = undefined;
-              ra = undefined;
-            }
+            const el = engine.orbitalElements(sel, sun);
+            a = el.a;
+            e = el.e;
+            i = el.i;
+            Omega = el.Omega;
+            omega = el.omega;
+            nu = el.nu;
+            rp = el.rp;
+            ra = el.ra;
+            period = el.period;
+            retrograde = el.retrograde;
+            unbound = el.unbound;
+            kind = el.kind;
           }
           setSelected({
             id: sel.id,
             name: sel.name,
             color: sel.color,
             mass: sel.mass,
-            radius: sel.radius,
-            speed: Math.hypot(sel.vx, sel.vy),
+            physicalRadius: sel.physicalRadius,
+            renderRadius: sel.renderRadius,
+            speed: Math.hypot(sel.vx, sel.vy, sel.vz),
             distToSun,
             energy,
             isStar: sel.isStar,
             isBlackHole: sel.isBlackHole,
             userLaunched: sel.userLaunched,
+            gravityMode: sel.gravityMode,
             age: engine.time - sel.createdAt,
             period,
             a,
             e,
+            i,
+            Omega,
+            omega,
+            nu,
             rp,
             ra,
             retrograde,
             unbound,
+            kind,
+            x: rel.x,
+            y: rel.y,
+            z: rel.z,
+            vx: rel.vx,
+            vy: rel.vy,
+            vz: rel.vz,
+            scientific: scientificProperties(sel, sun && sun !== sel ? sun : undefined, engine.G),
           });
         }
       }
@@ -259,10 +302,13 @@ export default function App() {
       if (!p) return;
       engine.dt = p.dt ?? 0.0002;
       engine.softening = p.softening ?? 0.003;
-      engine.reset(p.bodies.map((b) => ({ ...b })));
+      engine.reset(p.bodies.map((b) => ({ ...b })), { epoch: p.epoch ?? null });
+      engine.adaptiveDt = false;
+      update({ adaptiveDt: false });
       // 每日任务：只清进度不清完成，切场景不丢星星
       tracker.softReset();
       setPresetId(id);
+      setEphMeta(null);
       setSelected(null);
       update({ selectedId: null, followId: null });
       canvasRef.current?.setView({ x: 0, y: 0 }, p.viewRadius);
@@ -270,6 +316,55 @@ export default function App() {
       setMissions(tracker.update(engine));
     },
     [engine, tracker, update, pushLog],
+  );
+
+  const handleLoadEphemeris = useCallback(
+    async (source: 'horizons' | 'keplerian') => {
+      if (ephLoading) return;
+      setEphLoading(true);
+      update({ running: false });
+      try {
+        const loaded = await loadSolarSystem({
+          epoch: epochDate,
+          includeSpacecraft,
+          includeMoons,
+          source: source === 'keplerian' ? 'keplerian' : 'auto',
+          fetchStates:
+            source === 'keplerian'
+              ? undefined
+              : async (req) => queryHorizonsStates({ data: req }),
+        });
+        engine.dt = loaded.dt;
+        engine.softening = loaded.softening;
+        engine.gMultiplier = 1;
+        engine.adaptiveDt = true;
+        setGMultiplier(1);
+        update({ adaptiveDt: true, showRoche: true });
+        engine.reset(loaded.bodies.map((b) => ({ ...b })), { epoch: loaded.epoch });
+        tracker.softReset();
+        prevTimeRef.current = engine.time;
+        setPresetId('nasa-jpl');
+        setEphMeta({
+          source: loaded.source,
+          timeScale: loaded.timeScale,
+          label: `${loaded.center} · ${loaded.referenceFrame}`,
+        });
+        setSelected(null);
+        update({ selectedId: null, followId: null, running: false });
+        canvasRef.current?.setView({ x: 0, y: 0 }, loaded.viewRadius);
+        setMissions(tracker.update(engine));
+        setSimTime(engine.time);
+        setBodyCount(engine.bodies.length);
+        const src = describeEphemerisSource(loaded.source);
+        pushLog(`已加载真实太阳系 · ${src} · ${loaded.epoch.slice(0, 10)} ${loaded.timeScale}`, 'success');
+        for (const w of loaded.warnings.slice(0, 3)) pushLog(w, 'info');
+      } catch (err) {
+        pushLog(`星历加载失败：${err instanceof Error ? err.message : 'error'}`, 'warn');
+      } finally {
+        setEphLoading(false);
+      }
+    },
+    [ephLoading, epochDate, includeSpacecraft, includeMoons, engine, tracker, update, pushLog],
   );
 
   const handleReroll = useCallback(() => {
@@ -463,10 +558,34 @@ export default function App() {
             <div className="text-sm font-bold tracking-wide text-white">
               <span className="text-amber-300">☀</span> 太阳系物理引擎
             </div>
-            <div className="font-mono text-[11px] text-slate-400">{formatTime(simTime)}</div>
+            <div className="font-mono text-[11px] text-cyan-200/90">
+              {formatSimClock(engine.epoch, simTime, engine.simulationDate, ephMeta?.timeScale ?? 'UTC')}
+            </div>
+            <div className="font-mono text-[10px] text-slate-500">
+              {formatTime(simTime)}
+              {ephMeta && (
+                <span className="ml-2 text-amber-200/80">
+                  {ephMeta.source === 'horizons-cache'
+                    ? 'DE441'
+                    : ephMeta.source === 'horizons-live'
+                      ? 'Horizons'
+                      : 'Keplerian'}
+                  {' · '}
+                  {ephMeta.timeScale}
+                </span>
+              )}
+            </div>
           </div>
           <div className="h-8 w-px bg-white/10" />
           <div className="flex items-center gap-1.5">
+            <Btn
+              active={settings.uiMode === 'science'}
+              onClick={() => update({ uiMode: settings.uiMode === 'science' ? 'game' : 'science' })}
+              className="w-[5.5rem]"
+              title="GAME / SCIENCE"
+            >
+              {settings.uiMode === 'science' ? 'SCIENCE' : 'GAME'}
+            </Btn>
             <Btn onClick={() => update({ running: !settings.running })} className="w-16" title="空格">
               {settings.running ? '⏸ 暂停' : '▶ 继续'}
             </Btn>
@@ -519,6 +638,15 @@ export default function App() {
           dailyDate={dailyDate}
           rerollsLeft={rerollsLeft}
           onReroll={handleReroll}
+          epochDate={epochDate}
+          onEpochDate={setEpochDate}
+          includeSpacecraft={includeSpacecraft}
+          onIncludeSpacecraft={setIncludeSpacecraft}
+          includeMoons={includeMoons}
+          onIncludeMoons={setIncludeMoons}
+          ephemerisLoading={ephLoading}
+          ephemerisMeta={ephMeta}
+          onLoadEphemeris={handleLoadEphemeris}
         />
       </div>
 
@@ -571,9 +699,13 @@ export default function App() {
         </div>
       )}
 
-      {/* Bottom-left: body card + logs + help */}
+      {/* Bottom-left: body card + logs + help + diagnostics */}
       <div className="pointer-events-none absolute bottom-3 left-3 flex flex-col items-start gap-2">
-        {showHelp && (
+          <DiagnosticsPanel
+            report={settings.uiMode === 'science' ? drift : null}
+            encounter={settings.uiMode === 'science' ? encounter : null}
+          />
+        {showHelp && !selected && (
           <Panel className="pointer-events-auto max-w-xs px-3 py-2 text-[11px] leading-relaxed text-slate-300">
             <div className="mb-1 flex items-center justify-between">
               <span className="font-semibold text-white">操作指南</span>
@@ -586,7 +718,9 @@ export default function App() {
               <li>滚轮 / 双指缩放；Shift+拖动 或 右键拖动 平移</li>
               <li>单击选中天体，双击跟随；F 切换跟随</li>
               <li>空格 暂停；+/- 缩放；Delete 删除选中天体</li>
-              <li>◆ L1–L5 为拉格朗日点标记（随「显示名称」开关）</li>
+              <li>◆ L1–L5 拉格朗日点；Hill / SOI / Roche 可在控制台开关</li>
+              <li>GAME / SCIENCE 切换同一引擎的玩法与科学面板</li>
+              <li>NASA / JPL：右侧选历元加载真实太阳系；勾选卫星后跟随木星并放大</li>
               <li>🕳 可发射黑洞，或用事件召唤流浪黑洞；双击黑洞可跟随观察吸积</li>
               <li>完成右侧任务，或制造你自己的星系灾难</li>
             </ul>
@@ -596,6 +730,7 @@ export default function App() {
           <div className="pointer-events-auto">
             <BodyCard
               body={selected}
+              mode={settings.uiMode}
               following={settings.followId === selected.id}
               onFollow={() => update({ followId: settings.followId === selected.id ? null : selected.id })}
               onDelete={() => {
@@ -607,7 +742,11 @@ export default function App() {
                 const b = engine.getBody(selected.id);
                 if (b) {
                   b.mass *= f;
-                  b.radius *= Math.cbrt(f);
+                  const c = Math.cbrt(f);
+                  b.physicalRadius *= c;
+                  b.renderRadius *= c;
+                  if (!engine.arcadeCollisions) b.collisionRadius = b.physicalRadius;
+                  else b.collisionRadius *= c;
                 }
               }}
               onClose={() => {

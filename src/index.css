@@ -1,1 +1,29 @@
 @import "tailwindcss";
+
+@theme {
+  --color-bg: #02030a;
+  --color-surface: #070b18;
+  --color-fg: #e2e8f0;
+  --color-muted: #94a3b8;
+  --color-primary: #67e8f9;
+  --color-accent: #ffd27a;
+  --color-border: #1e293b;
+  --radius: 0.75rem;
+  --font-sans: "IBM Plex Sans", "Noto Sans SC", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    background: #02030a;
+    color: #e2e8f0;
+  }
+}

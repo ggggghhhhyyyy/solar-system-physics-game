@@ -1,142 +1,140 @@
-import type { Body, BodySpec, SimEvent } from './types';
+import {
+  BH_THRESHOLD,
+  BH_THETA,
+  G0,
+  GRID_MIN,
+  GRID_THRESHOLD,
+  HASH_X,
+  HASH_Y,
+  HASH_Z,
+  R_SCHWARZSCHILD_SUN_AU,
+  TRAIL_MAX,
+} from './constants.ts';
+import {
+  computeConservation,
+  computeDrift,
+  type ConservationSnapshot,
+  type DriftReport,
+} from './diagnostics/conservation.ts';
+import { leapfrog } from './integrators/leapfrog.ts';
+import { addForceFromOctree, OctNode } from './octree.ts';
+import { classicalElements, type ClassicalElements } from './orbital/elements.ts';
+import { rocheLimitAU } from './orbital/roche.ts';
+import type { Body, BodySpec, GravityMode, Integrator, SimEvent, StateVector } from './types.ts';
+import { finite3 } from './vec.ts';
 
-/** Gravitational constant in AU^3 / (M_sun * yr^2) */
-export const G0 = 4 * Math.PI * Math.PI;
+export { G0, TRAIL_MAX };
 
-export const TRAIL_MAX = 600;
+function schwarzschildAU(mass: number): number {
+  return R_SCHWARZSCHILD_SUN_AU * Math.max(mass, 0);
+}
 
-// Phase5 阈值与常量。
-// N<=150 直接求和更快(建树/哈希开销主导);N^2≈22500 对以下 O(N^2)常数小,经验交叉点约100-200,取150。
-const BH_THRESHOLD = 150;
-// 碰撞网格分发阈值,与力计算同值:小 N 双循环常数更小。
-const GRID_THRESHOLD = 150;
-// Barnes-Hut 开角阈值 s/d<theta 则近似;0.7 为精度/速度常用折中。
-const BH_THETA = 0.7;
-// 网格整数哈希乘子(大质数分散格坐标)。
-const HASH_X = 73856093;
-const HASH_Y = 19349663;
-// 网格最小格距,防零半径/重合导致除零。
-const GRID_MIN = 1e-4;
+export function resolveRadii(spec: BodySpec): {
+  physicalRadius: number;
+  collisionRadius: number;
+  renderRadius: number;
+} {
+  const physical =
+    spec.physicalRadius ??
+    (spec.isBlackHole ? schwarzschildAU(spec.mass) : (spec.radius ?? 0));
+  const collision = spec.collisionRadius ?? physical;
+  const render = spec.renderRadius ?? spec.radius ?? physical;
+  return {
+    physicalRadius: physical,
+    collisionRadius: collision,
+    renderRadius: render,
+  };
+}
 
-// Barnes-Hut 四叉树节点(文件内私有,不导出)。叶容量1,空节点mass==0,查询时跳过。
-class QuadNode {
-  cx: number;
-  cy: number;
-  half: number;
-  mass = 0;
-  comX = 0;
-  comY = 0;
-  body = -1; // 叶中暂存的天体下标,-1 为空
-  children: QuadNode[] | null = null;
-
-  constructor(cx: number, cy: number, half: number) {
-    this.cx = cx;
-    this.cy = cy;
-    this.half = half;
-  }
-
-  private childFor(x: number, y: number): QuadNode {
-    const ch = this.children as QuadNode[];
-    const east = x > this.cx ? 1 : 0;
-    const north = y > this.cy ? 1 : 0;
-    return ch[(north << 1) | east];
-  }
-
-  insert(idx: number, xs: Float64Array, ys: Float64Array, ms: Float64Array): void {
-    if (this.children === null) {
-      if (this.body === -1) {
-        this.body = idx;
-        this.mass = ms[idx];
-        this.comX = xs[idx];
-        this.comY = ys[idx];
-        return;
-      }
-      // 重合退化:不再细分,质量已在下式计入,保终止。
-      if (this.half < 1e-12) {
-        const m = ms[idx];
-        const tot = this.mass + m;
-        if (tot > 0) {
-          this.comX = (this.comX * this.mass + xs[idx] * m) / tot;
-          this.comY = (this.comY * this.mass + ys[idx] * m) / tot;
-        }
-        this.mass = tot;
-        return;
-      }
-      const old = this.body;
-      this.body = -1;
-      const h = this.half / 2;
-      this.children = [
-        new QuadNode(this.cx - h, this.cy - h, h),
-        new QuadNode(this.cx + h, this.cy - h, h),
-        new QuadNode(this.cx - h, this.cy + h, h),
-        new QuadNode(this.cx + h, this.cy + h, h),
-      ];
-      this.childFor(xs[old], ys[old]).insert(old, xs, ys, ms);
-      this.childFor(xs[idx], ys[idx]).insert(idx, xs, ys, ms);
-      // 由子节点重算质量加权质心。
-      let tot = 0;
-      let cx = 0;
-      let cy = 0;
-      for (const c of this.children) {
-        if (c.mass === 0) continue;
-        const nt = tot + c.mass;
-        cx = (cx * tot + c.comX * c.mass) / nt;
-        cy = (cy * tot + c.comY * c.mass) / nt;
-        tot = nt;
-      }
-      this.mass = tot;
-      this.comX = cx;
-      this.comY = cy;
-      return;
-    }
-    const m = ms[idx];
-    const tot = this.mass + m;
-    if (tot > 0) {
-      this.comX = (this.comX * this.mass + xs[idx] * m) / tot;
-      this.comY = (this.comY * this.mass + ys[idx] * m) / tot;
-    }
-    this.mass = tot;
-    this.childFor(xs[idx], ys[idx]).insert(idx, xs, ys, ms);
-  }
+function resolveGravityMode(spec: BodySpec): GravityMode {
+  if (spec.gravityMode) return spec.gravityMode;
+  return 'massive';
 }
 
 export class Engine {
   bodies: Body[] = [];
-  time = 0; // years
-  dt = 0.0002; // years per integration step (~0.073 days)
-  softening = 0.003; // AU
+  time = 0;
+  dt = 0.0002;
+  softening = 0.003;
   gMultiplier = 1;
   collisionsEnabled = true;
-  trailInterval = 0.0025; // years between trail samples
-  escapeDistance = 400; // AU – bodies beyond this are removed
+  /** Arcade-only: if true, callers may inflate collisionRadius. Default off. */
+  arcadeCollisions = false;
+  trailInterval = 0.0025;
+  escapeDistance = 400;
+  integrator: Integrator = leapfrog;
+  /** ISO-8601 epoch. Null → UI shows T+ elapsed. */
+  epoch: string | null = null;
+  /**
+   * Split a step into n leapfrog substeps when an encounter timescale
+   * is shorter than dt. Each substep still uses the symplectic KDK kick.
+   * Off by default so game presets do not change.
+   */
+  adaptiveDt = false;
+  maxSubsteps = 16;
 
   private events: SimEvent[] = [];
   private nextId = 1;
   private lastTrailTime = 0;
   private needAccel = true;
+  private baseline: ConservationSnapshot | null = null;
+  private tideInside = new Set<string>();
+
+  private sx = new Float64Array(0);
+  private sy = new Float64Array(0);
+  private sz = new Float64Array(0);
+  private sm = new Float64Array(0);
+  private sax = new Float64Array(0);
+  private say = new Float64Array(0);
+  private saz = new Float64Array(0);
+  private sr = new Float64Array(0);
 
   get G(): number {
     return G0 * this.gMultiplier;
   }
 
-  // Scratch buffers (structure-of-arrays) for the O(N^2) force loop
-  private sx = new Float64Array(0);
-  private sy = new Float64Array(0);
-  private sm = new Float64Array(0);
-  private sax = new Float64Array(0);
-  private say = new Float64Array(0);
+  /** Years since reset. */
+  get elapsedTime(): number {
+    return this.time;
+  }
+
+  /** Wall-clock simulation date, or null when no epoch is set. */
+  get simulationDate(): Date | null {
+    if (!this.epoch) return null;
+    const t0 = Date.parse(this.epoch);
+    if (!Number.isFinite(t0)) return null;
+    return new Date(t0 + this.time * 365.25 * 86_400_000);
+  }
+
+  private ensureBuffers(n: number): void {
+    if (this.sx.length >= n) return;
+    const cap = Math.max(n, 64) * 2;
+    this.sx = new Float64Array(cap);
+    this.sy = new Float64Array(cap);
+    this.sz = new Float64Array(cap);
+    this.sm = new Float64Array(cap);
+    this.sax = new Float64Array(cap);
+    this.say = new Float64Array(cap);
+    this.saz = new Float64Array(cap);
+  }
 
   private makeBody(spec: BodySpec): Body {
-    // explicit field order => monomorphic object shape for V8
+    const radii = resolveRadii(spec);
     return {
       name: spec.name,
       key: spec.key,
       mass: spec.mass,
-      radius: spec.radius,
+      physicalRadius: radii.physicalRadius,
+      collisionRadius: this.arcadeCollisions
+        ? radii.collisionRadius
+        : radii.physicalRadius,
+      renderRadius: radii.renderRadius,
       x: spec.x,
       y: spec.y,
+      z: spec.z ?? 0,
       vx: spec.vx,
       vy: spec.vy,
+      vz: spec.vz ?? 0,
       color: spec.color,
       isStar: !!spec.isStar && !spec.isBlackHole,
       isBlackHole: !!spec.isBlackHole,
@@ -144,9 +142,11 @@ export class Engine {
       ring: !!spec.ring,
       userLaunched: !!spec.userLaunched,
       fixed: !!spec.fixed,
+      gravityMode: resolveGravityMode(spec),
       id: this.nextId++,
       ax: 0,
       ay: 0,
+      az: 0,
       createdAt: this.time,
       trail: new Float32Array(TRAIL_MAX * 2),
       trailHead: 0,
@@ -154,12 +154,17 @@ export class Engine {
     };
   }
 
-  reset(specs: BodySpec[]): void {
+  reset(specs: BodySpec[], opts?: { epoch?: string | null }): void {
     this.time = 0;
     this.lastTrailTime = 0;
     this.events = [];
+    this.nextId = 1;
     this.bodies = specs.map((s) => this.makeBody(s));
     this.needAccel = true;
+    this.tideInside.clear();
+    if (opts && 'epoch' in opts) this.epoch = opts.epoch ?? null;
+    this.computeAccel();
+    this.baseline = computeConservation(this.bodies, this.G, this.softening);
   }
 
   addBody(spec: BodySpec): Body {
@@ -198,206 +203,323 @@ export class Engine {
     }
   }
 
+  captureBaseline(): void {
+    this.baseline = computeConservation(this.bodies, this.G, this.softening);
+  }
+
+  /** Public hook for tests / adapters. Does not advance time. */
+  refreshAccel(): void {
+    this.computeAccel();
+  }
+
+  diagnostics(): DriftReport {
+    const current = computeConservation(this.bodies, this.G, this.softening);
+    return computeDrift(current, this.baseline);
+  }
+
+  applyStateVector(id: number, sv: StateVector): boolean {
+    const b = this.getBody(id);
+    if (!b) return false;
+    b.x = sv.x;
+    b.y = sv.y;
+    b.z = sv.z;
+    b.vx = sv.vx;
+    b.vy = sv.vy;
+    b.vz = sv.vz;
+    this.needAccel = true;
+    return true;
+  }
+
+  orbitalElements(body: Body, ref: Body): ClassicalElements {
+    return classicalElements(
+      { x: body.x - ref.x, y: body.y - ref.y, z: body.z - ref.z },
+      { x: body.vx - ref.vx, y: body.vy - ref.vy, z: body.vz - ref.vz },
+      this.G * (ref.mass + body.mass),
+    );
+  }
+
+  private isMassive(b: Body): boolean {
+    return b.gravityMode !== 'test-particle' && b.mass > 0;
+  }
+
   private computeAccel(): void {
     const bs = this.bodies;
     const n = bs.length;
     const G = this.G;
     const eps2 = this.softening * this.softening;
+    this.ensureBuffers(n);
 
-    // Phase5 分发:N>150 走 Barnes-Hut 近似,小 N 走原直接求和(下文原样)。
-    if (n > BH_THRESHOLD) {
-      this.computeAccelBarnesHut();
-      return;
+    const massiveIdx: number[] = [];
+    const testIdx: number[] = [];
+    for (let i = 0; i < n; i++) {
+      if (this.isMassive(bs[i])) massiveIdx.push(i);
+      else testIdx.push(i);
     }
-    if (this.sx.length < n) {
-      const cap = Math.max(n, 64) * 2;
-      this.sx = new Float64Array(cap);
-      this.sy = new Float64Array(cap);
-      this.sm = new Float64Array(cap);
-      this.sax = new Float64Array(cap);
-      this.say = new Float64Array(cap);
-    }
-    const xs = this.sx, ys = this.sy, ms = this.sm, axs = this.sax, ays = this.say;
+
+    const xs = this.sx;
+    const ys = this.sy;
+    const zs = this.sz;
+    const ms = this.sm;
+    const axs = this.sax;
+    const ays = this.say;
+    const azs = this.saz;
     for (let i = 0; i < n; i++) {
       const b = bs[i];
       xs[i] = b.x;
       ys[i] = b.y;
-      ms[i] = b.mass * G;
+      zs[i] = b.z;
+      ms[i] = b.mass;
       axs[i] = 0;
       ays[i] = 0;
+      azs[i] = 0;
     }
-    for (let i = 0; i < n; i++) {
+
+    const nM = massiveIdx.length;
+    if (nM > BH_THRESHOLD) {
+      this.computeAccelBarnesHut(massiveIdx, testIdx);
+      return;
+    }
+
+    for (let a = 0; a < nM; a++) {
+      const i = massiveIdx[a];
       const xi = xs[i];
       const yi = ys[i];
-      const mi = ms[i];
+      const zi = zs[i];
+      const miG = ms[i] * G;
       let ax = 0;
       let ay = 0;
-      for (let j = i + 1; j < n; j++) {
+      let az = 0;
+      for (let b = a + 1; b < nM; b++) {
+        const j = massiveIdx[b];
         const dx = xs[j] - xi;
         const dy = ys[j] - yi;
-        const r2 = dx * dx + dy * dy + eps2;
+        const dz = zs[j] - zi;
+        const r2 = dx * dx + dy * dy + dz * dz + eps2;
         const inv = 1 / (r2 * Math.sqrt(r2));
         const fx = dx * inv;
         const fy = dy * inv;
-        ax += ms[j] * fx;
-        ay += ms[j] * fy;
-        axs[j] -= mi * fx;
-        ays[j] -= mi * fy;
+        const fz = dz * inv;
+        const mjG = ms[j] * G;
+        ax += mjG * fx;
+        ay += mjG * fy;
+        az += mjG * fz;
+        axs[j] -= miG * fx;
+        ays[j] -= miG * fy;
+        azs[j] -= miG * fz;
       }
       axs[i] += ax;
       ays[i] += ay;
+      azs[i] += az;
     }
-    for (let i = 0; i < n; i++) {
-      bs[i].ax = axs[i];
-      bs[i].ay = ays[i];
+
+    for (let t = 0; t < testIdx.length; t++) {
+      const i = testIdx[t];
+      const xi = xs[i];
+      const yi = ys[i];
+      const zi = zs[i];
+      if (!finite3(xi, yi, zi)) continue;
+      let ax = 0;
+      let ay = 0;
+      let az = 0;
+      for (let a = 0; a < nM; a++) {
+        const j = massiveIdx[a];
+        const dx = xs[j] - xi;
+        const dy = ys[j] - yi;
+        const dz = zs[j] - zi;
+        const r2 = dx * dx + dy * dy + dz * dz + eps2;
+        const inv = 1 / (r2 * Math.sqrt(r2));
+        const mjG = ms[j] * G;
+        ax += mjG * dx * inv;
+        ay += mjG * dy * inv;
+        az += mjG * dz * inv;
+      }
+      axs[i] = ax;
+      ays[i] = ay;
+      azs[i] = az;
     }
-    // 极端防护:非有限坐标静默置零(不扩展 SimEvent 类型,故无事件);有限输入下为 no-op。
+
     for (let i = 0; i < n; i++) {
-      if (!Number.isFinite(xs[i]) || !Number.isFinite(ys[i])) {
+      if (!finite3(xs[i], ys[i], zs[i])) {
         bs[i].ax = 0;
         bs[i].ay = 0;
+        bs[i].az = 0;
+      } else {
+        bs[i].ax = axs[i];
+        bs[i].ay = ays[i];
+        bs[i].az = azs[i];
       }
     }
     this.needAccel = false;
   }
 
-  // Barnes-Hut 近似路径(N>150)。树每 step 重建:每步位移小,后续可做增量优化。
-  // fixed 有质量仍建树(提供引力);computeAccel 照算其 ax/ay,step 里跳过 kick(原语义)。
-  private computeAccelBarnesHut(): void {
+  private computeAccelBarnesHut(massiveIdx: number[], testIdx: number[]): void {
     const bs = this.bodies;
     const n = bs.length;
     const G = this.G;
     const eps2 = this.softening * this.softening;
-    if (this.sx.length < n) {
-      const cap = Math.max(n, 64) * 2;
-      this.sx = new Float64Array(cap);
-      this.sy = new Float64Array(cap);
-      this.sm = new Float64Array(cap);
-      this.sax = new Float64Array(cap);
-      this.say = new Float64Array(cap);
-    }
-    const xs = this.sx, ys = this.sy, ms = this.sm, axs = this.sax, ays = this.say;
-    for (let i = 0; i < n; i++) {
-      const b = bs[i];
-      xs[i] = b.x;
-      ys[i] = b.y;
-      ms[i] = b.mass;
-      axs[i] = 0;
-      ays[i] = 0;
-    }
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    for (let i = 0; i < n; i++) {
-      const x = xs[i], y = ys[i];
-      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const xs = this.sx;
+    const ys = this.sy;
+    const zs = this.sz;
+    const ms = this.sm;
+    const axs = this.sax;
+    const ays = this.say;
+    const azs = this.saz;
+
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (const i of massiveIdx) {
+      const x = xs[i];
+      const y = ys[i];
+      const z = zs[i];
+      if (!finite3(x, y, z)) continue;
       if (x < minX) minX = x;
       if (x > maxX) maxX = x;
       if (y < minY) minY = y;
       if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
     }
     if (minX === Infinity) {
-      for (let i = 0; i < n; i++) { bs[i].ax = 0; bs[i].ay = 0; }
+      for (let i = 0; i < n; i++) {
+        bs[i].ax = 0;
+        bs[i].ay = 0;
+        bs[i].az = 0;
+      }
       this.needAccel = false;
       return;
     }
-    const range = Math.max(maxX - minX, maxY - minY);
+    const range = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
     const half = Math.max(range / 2, 1e-9) * 1.05 + 1e-9;
-    const root = new QuadNode((minX + maxX) / 2, (minY + maxY) / 2, half);
-    for (let i = 0; i < n; i++) {
-      if (!Number.isFinite(xs[i]) || !Number.isFinite(ys[i])) continue;
-      if (!(ms[i] > 0)) continue; // 零质量不提供引力,跳过建树
-      root.insert(i, xs, ys, ms);
+    const root = new OctNode(
+      (minX + maxX) / 2,
+      (minY + maxY) / 2,
+      (minZ + maxZ) / 2,
+      half,
+    );
+    for (const i of massiveIdx) {
+      if (!finite3(xs[i], ys[i], zs[i])) continue;
+      if (!(ms[i] > 0)) continue;
+      root.insert(i, xs, ys, zs, ms);
     }
-    for (let i = 0; i < n; i++) {
-      if (!Number.isFinite(xs[i]) || !Number.isFinite(ys[i])) {
+
+    const query = (i: number) => {
+      if (!finite3(xs[i], ys[i], zs[i])) {
         axs[i] = 0;
         ays[i] = 0;
-        continue;
+        azs[i] = 0;
+        return;
       }
-      this.addForceFromNode(root, i, xs[i], ys[i], eps2, G, axs, ays);
-    }
+      addForceFromOctree(root, i, xs[i], ys[i], zs[i], eps2, G, BH_THETA, axs, ays, azs);
+    };
+    for (const i of massiveIdx) query(i);
+    for (const i of testIdx) query(i);
+
     for (let i = 0; i < n; i++) {
       bs[i].ax = axs[i];
       bs[i].ay = ays[i];
+      bs[i].az = azs[i];
     }
     this.needAccel = false;
   }
 
-  private addForceFromNode(
-    node: QuadNode, target: number, xi: number, yi: number,
-    eps2: number, G: number, axs: Float64Array, ays: Float64Array,
-  ): void {
-    if (node.mass === 0) return; // 空节点跳过
-    if (node.children === null) {
-      const j = node.body;
-      if (j === -1 || j === target) return; // 空/自体跳过
-      const dx = node.comX - xi;
-      const dy = node.comY - yi;
-      const r2 = dx * dx + dy * dy + eps2; // softening 与直接法一致
-      const inv = 1 / (r2 * Math.sqrt(r2));
-      const f = G * node.mass * inv;
-      axs[target] += f * dx;
-      ays[target] += f * dy;
-      return;
+  suggestedSubsteps(): number {
+    if (!this.adaptiveDt) return 1;
+    let tau = Infinity;
+    const bs = this.bodies;
+    const n = bs.length;
+    for (let i = 0; i < n; i++) {
+      const a = bs[i];
+      for (let j = i + 1; j < n; j++) {
+        const b = bs[j];
+        if (a.noCollide && b.noCollide) continue;
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        const dz = a.z - b.z;
+        const r = Math.hypot(dx, dy, dz);
+        if (!(r > 0) || !Number.isFinite(r)) continue;
+        const v = Math.hypot(a.vx - b.vx, a.vy - b.vy, a.vz - b.vz);
+        if (v > 1e-18) {
+          const t = r / v;
+          if (t < tau) tau = t;
+        }
+      }
     }
-    const dx = node.comX - xi;
-    const dy = node.comY - yi;
-    const r2 = dx * dx + dy * dy + eps2;
-    const dist = Math.sqrt(r2);
-    const s = node.half * 2;
-    // 目标在节点内则强制细分,避自引力误差;否则 s/d<theta 近似为单质点。
-    const inside = Math.abs(xi - node.cx) <= node.half && Math.abs(yi - node.cy) <= node.half;
-    if (!inside && s / dist < BH_THETA) {
-      const inv = 1 / (r2 * dist);
-      const f = G * node.mass * inv;
-      axs[target] += f * dx;
-      ays[target] += f * dy;
-      return;
-    }
-    const ch = node.children as QuadNode[];
-    for (let k = 0; k < 4; k++) {
-      const c = ch[k];
-      if (c.mass === 0) continue;
-      this.addForceFromNode(c, target, xi, yi, eps2, G, axs, ays);
-    }
+    if (!Number.isFinite(tau)) return 1;
+    const target = Math.max(tau * 0.05, this.dt / this.maxSubsteps);
+    return Math.max(1, Math.min(this.maxSubsteps, Math.ceil(this.dt / target)));
   }
 
-  /** One leapfrog (kick-drift-kick) step. */
-  step(): void {
-    if (this.needAccel) this.computeAccel();
-    const dt = this.dt;
-    const half = dt * 0.5;
-    const bs = this.bodies;
-    for (const b of bs) {
-      if (b.fixed) continue;
-      b.vx += b.ax * half;
-      b.vy += b.ay * half;
-      b.x += b.vx * dt;
-      b.y += b.vy * dt;
-    }
-    this.computeAccel();
-    for (const b of bs) {
-      if (b.fixed) continue;
-      b.vx += b.ax * half;
-      b.vy += b.ay * half;
-    }
-    this.time += dt;
+  private pairTideKey(a: Body, b: Body): string {
+    return a.id < b.id ? `${a.id}:${b.id}` : `${b.id}:${a.id}`;
+  }
 
-    if (this.collisionsEnabled) this.handleCollisions();
+  private scanTides(): void {
+    const bs = this.bodies;
+    const n = bs.length;
+    const inside = new Set<string>();
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const a = bs[i];
+        const b = bs[j];
+        const primary = a.mass >= b.mass ? a : b;
+        const sat = primary === a ? b : a;
+        if (!(sat.mass > 0) || sat.isBlackHole) continue;
+        const d = rocheLimitAU(primary, sat, 'fluid');
+        if (d == null) continue;
+        const r = Math.hypot(sat.x - primary.x, sat.y - primary.y, sat.z - primary.z);
+        if (!(r < d)) continue;
+        const key = this.pairTideKey(a, b);
+        inside.add(key);
+        if (this.tideInside.has(key)) continue;
+        const tde = !!primary.isBlackHole && r > primary.physicalRadius;
+        this.events.push({
+          type: tde ? 'tde' : 'roche',
+          time: this.time,
+          primary,
+          secondary: sat,
+          separationAU: r,
+          rocheAU: d,
+        });
+      }
+    }
+    this.tideInside = inside;
+  }
+
+  step(): void {
+    const nSub = this.suggestedSubsteps();
+    const h = this.dt / nSub;
+    const saved = this.dt;
+    this.dt = h;
+    for (let s = 0; s < nSub; s++) {
+      if (this.needAccel) this.computeAccel();
+      this.integrator.step({
+        bodies: this.bodies,
+        dt: h,
+        computeAccel: () => this.computeAccel(),
+      });
+      this.time += h;
+      if (this.collisionsEnabled) this.handleCollisions();
+    }
+    this.dt = saved;
     this.removeEscapees();
+    this.scanTides();
 
     if (this.time - this.lastTrailTime >= this.trailInterval) {
       this.lastTrailTime = this.time;
-      for (const b of bs) {
-        const h = b.trailHead;
-        b.trail[h * 2] = b.x;
-        b.trail[h * 2 + 1] = b.y;
-        b.trailHead = (h + 1) % TRAIL_MAX;
+      for (const b of this.bodies) {
+        const h2 = b.trailHead;
+        b.trail[h2 * 2] = b.x;
+        b.trail[h2 * 2 + 1] = b.y;
+        b.trailHead = (h2 + 1) % TRAIL_MAX;
         if (b.trailCount < TRAIL_MAX) b.trailCount++;
       }
     }
   }
 
-  /** Advance simulation by `years` of simulated time, capped at maxSteps. */
   advance(years: number, maxSteps = 600): void {
     let steps = Math.round(years / this.dt);
     if (steps > maxSteps) steps = maxSteps;
@@ -413,7 +535,8 @@ export class Engine {
       if (b === ref) continue;
       const dx = b.x - ref.x;
       const dy = b.y - ref.y;
-      if (dx * dx + dy * dy > lim2) {
+      const dz = b.z - ref.z;
+      if (dx * dx + dy * dy + dz * dz > lim2) {
         this.bodies.splice(i, 1);
         this.events.push({ type: 'escaped', time: this.time, body: b });
         this.needAccel = true;
@@ -421,10 +544,7 @@ export class Engine {
     }
   }
 
-  private sr = new Float64Array(0);
-
   private handleCollisions(): void {
-    // Phase5 分发:N>150 走空间哈希,小 N 走原双循环(下文原样)。
     if (this.bodies.length > GRID_THRESHOLD) {
       this.handleCollisionsHashed();
       return;
@@ -434,28 +554,23 @@ export class Engine {
       merged = false;
       const bs = this.bodies;
       const n = bs.length;
+      this.ensureBuffers(n);
       if (this.sr.length < n) this.sr = new Float64Array(Math.max(n, 64) * 2);
-      if (this.sx.length < n) {
-        this.sx = new Float64Array(Math.max(n, 64) * 2);
-        this.sy = new Float64Array(Math.max(n, 64) * 2);
-      }
-      const xs = this.sx, ys = this.sy, rs = this.sr;
-      // sx/sy hold positions from the last computeAccel (called at end of step), so they are current
+      const xs = this.sx;
+      const ys = this.sy;
+      const zs = this.sz;
+      const rs = this.sr;
       for (let i = 0; i < n; i++) {
         xs[i] = bs[i].x;
         ys[i] = bs[i].y;
-        rs[i] = bs[i].radius;
+        zs[i] = bs[i].z;
+        rs[i] = bs[i].collisionRadius;
       }
       outer: for (let i = 0; i < n; i++) {
-        const xi = xs[i], yi = ys[i], ri = rs[i];
-        // 两个 noCollide 天体之间跳过合并(碎块/气流互穿),其余组合正常检查
         const iNC = bs[i].noCollide;
         for (let j = i + 1; j < n; j++) {
           if (iNC && bs[j].noCollide) continue;
-          const dx = xi - xs[j];
-          const dy = yi - ys[j];
-          const rr = ri + rs[j];
-          if (dx * dx + dy * dy < rr * rr) {
+          if (this.pairHits(i, j, xs, ys, zs, rs, bs)) {
             this.merge(bs[i], bs[j]);
             merged = true;
             break outer;
@@ -465,8 +580,42 @@ export class Engine {
     }
   }
 
-  // 均匀网格碰撞(N>150)。格距=全体最大直径*2(钳 GRID_MIN),碰撞对必在同格/邻格,仅查 3x3。
-  // 复用 merge,一次只合一对后重建网格,保 while-merged 事件顺序语义;哈希碰撞仅增候选,距离过滤保正确。
+  private pairHits(
+    i: number,
+    j: number,
+    xs: Float64Array,
+    ys: Float64Array,
+    zs: Float64Array,
+    rs: Float64Array,
+    bs: Body[],
+  ): boolean {
+    const dx = xs[i] - xs[j];
+    const dy = ys[i] - ys[j];
+    const dz = zs[i] - zs[j];
+    const rr = rs[i] + rs[j];
+    const r2 = dx * dx + dy * dy + dz * dz;
+    if (r2 < rr * rr) return true;
+    const dvx = bs[i].vx - bs[j].vx;
+    const dvy = bs[i].vy - bs[j].vy;
+    const dvz = bs[i].vz - bs[j].vz;
+    const dt = this.dt;
+    const pdx = dx - dvx * dt;
+    const pdy = dy - dvy * dt;
+    const pdz = dz - dvz * dt;
+    const sx = dx - pdx;
+    const sy = dy - pdy;
+    const sz = dz - pdz;
+    const seg2 = sx * sx + sy * sy + sz * sz;
+    if (seg2 < 1e-30) return false;
+    let t = -((pdx * sx + pdy * sy + pdz * sz) / seg2);
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+    const cx = pdx + t * sx;
+    const cy = pdy + t * sy;
+    const cz = pdz + t * sz;
+    return cx * cx + cy * cy + cz * cz < rr * rr;
+  }
+
   private handleCollisionsHashed(): void {
     let merged = true;
     while (merged) {
@@ -474,16 +623,17 @@ export class Engine {
       const bs = this.bodies;
       const n = bs.length;
       if (n < 2) return;
+      this.ensureBuffers(n);
       if (this.sr.length < n) this.sr = new Float64Array(Math.max(n, 64) * 2);
-      if (this.sx.length < n) {
-        this.sx = new Float64Array(Math.max(n, 64) * 2);
-        this.sy = new Float64Array(Math.max(n, 64) * 2);
-      }
-      const xs = this.sx, ys = this.sy, rs = this.sr;
+      const xs = this.sx;
+      const ys = this.sy;
+      const zs = this.sz;
+      const rs = this.sr;
       for (let i = 0; i < n; i++) {
         xs[i] = bs[i].x;
         ys[i] = bs[i].y;
-        rs[i] = bs[i].radius;
+        zs[i] = bs[i].z;
+        rs[i] = bs[i].collisionRadius;
       }
       let maxR = 0;
       for (let i = 0; i < n; i++) if (rs[i] > maxR) maxR = rs[i];
@@ -491,29 +641,34 @@ export class Engine {
       if (!Number.isFinite(cell) || cell < GRID_MIN) cell = GRID_MIN;
       const grid = new Map<number, number[]>();
       for (let i = 0; i < n; i++) {
-        if (!Number.isFinite(xs[i]) || !Number.isFinite(ys[i])) continue;
+        if (!finite3(xs[i], ys[i], zs[i])) continue;
         const ix = Math.floor(xs[i] / cell);
         const iy = Math.floor(ys[i] / cell);
-        const key = ((ix * HASH_X) ^ (iy * HASH_Y)) | 0;
+        const iz = Math.floor(zs[i] / cell);
+        const key = ((ix * HASH_X) ^ (iy * HASH_Y) ^ (iz * HASH_Z)) | 0;
         const arr = grid.get(key);
         if (arr) arr.push(i);
         else grid.set(key, [i]);
       }
       outer: for (let i = 0; i < n; i++) {
-        if (!Number.isFinite(xs[i]) || !Number.isFinite(ys[i])) continue;
+        if (!finite3(xs[i], ys[i], zs[i])) continue;
         const ix = Math.floor(xs[i] / cell);
         const iy = Math.floor(ys[i] / cell);
+        const iz = Math.floor(zs[i] / cell);
         let cand: number[] | null = null;
         for (let dx = -1; dx <= 1; dx++) {
           for (let dy = -1; dy <= 1; dy++) {
-            const key = (((ix + dx) * HASH_X) ^ ((iy + dy) * HASH_Y)) | 0;
-            const arr = grid.get(key);
-            if (!arr) continue;
-            for (let k = 0; k < arr.length; k++) {
-              const j = arr[k];
-              if (j <= i) continue;
-              if (cand === null) cand = [];
-              cand.push(j);
+            for (let dz = -1; dz <= 1; dz++) {
+              const key =
+                (((ix + dx) * HASH_X) ^ ((iy + dy) * HASH_Y) ^ ((iz + dz) * HASH_Z)) | 0;
+              const arr = grid.get(key);
+              if (!arr) continue;
+              for (let k = 0; k < arr.length; k++) {
+                const j = arr[k];
+                if (j <= i) continue;
+                if (cand === null) cand = [];
+                cand.push(j);
+              }
             }
           }
         }
@@ -525,10 +680,7 @@ export class Engine {
           if (j === prev) continue;
           prev = j;
           if (bs[i].noCollide && bs[j].noCollide) continue;
-          const ddx = xs[i] - xs[j];
-          const ddy = ys[i] - ys[j];
-          const rr = rs[i] + rs[j];
-          if (ddx * ddx + ddy * ddy < rr * rr) {
+          if (this.pairHits(i, j, xs, ys, zs, rs, bs)) {
             this.merge(bs[i], bs[j]);
             merged = true;
             break outer;
@@ -542,33 +694,45 @@ export class Engine {
     const survivor = a.mass >= b.mass ? a : b;
     const other = survivor === a ? b : a;
     const total = a.mass + b.mass;
-    if (total > 0) {
-      if (!survivor.fixed) {
-        survivor.vx = (a.mass * a.vx + b.mass * b.vx) / total;
-        survivor.vy = (a.mass * a.vy + b.mass * b.vy) / total;
-        survivor.x = (a.mass * a.x + b.mass * b.x) / total;
-        survivor.y = (a.mass * a.y + b.mass * b.y) / total;
-      }
+    if (total > 0 && !survivor.fixed) {
+      survivor.vx = (a.mass * a.vx + b.mass * b.vx) / total;
+      survivor.vy = (a.mass * a.vy + b.mass * b.vy) / total;
+      survivor.vz = (a.mass * a.vz + b.mass * b.vz) / total;
+      survivor.x = (a.mass * a.x + b.mass * b.x) / total;
+      survivor.y = (a.mass * a.y + b.mass * b.y) / total;
+      survivor.z = (a.mass * a.z + b.mass * b.z) / total;
     }
+    const oldMass = survivor.mass;
     survivor.mass = total;
     survivor.noCollide = a.noCollide && b.noCollide;
+    if (survivor.gravityMode === 'test-particle' && other.gravityMode === 'massive') {
+      survivor.gravityMode = 'massive';
+    } else if (other.gravityMode === 'test-particle' && survivor.gravityMode === 'massive') {
+      // keep massive
+    } else if (survivor.gravityMode === 'test-particle' && other.gravityMode === 'test-particle') {
+      survivor.gravityMode = 'test-particle';
+    }
+
     if (survivor.isBlackHole || other.isBlackHole) {
-      // 任一为黑洞则合并后仍为黑洞(事件视界只增不减)。
-      // 黑洞视界正比于质量,显示半径按质量比缩放而非体积相加,避免吞星后视界暴涨。
-      const oldMass = survivor.mass - other.mass;
-      if (survivor.isBlackHole && oldMass > 0) {
-        survivor.radius *= Math.cbrt(total / oldMass);
+      survivor.physicalRadius = schwarzschildAU(total);
+      survivor.collisionRadius = this.arcadeCollisions
+        ? survivor.collisionRadius
+        : survivor.physicalRadius;
+      if (oldMass > 0) {
+        survivor.renderRadius *= Math.cbrt(total / oldMass);
       } else {
-        survivor.radius = Math.cbrt(
-          survivor.radius ** 3 + other.radius ** 3,
-        );
+        survivor.renderRadius = Math.cbrt(survivor.renderRadius ** 3 + other.renderRadius ** 3);
       }
       survivor.isBlackHole = true;
       survivor.isStar = false;
     } else {
-      survivor.radius = Math.cbrt(
-        survivor.radius ** 3 + other.radius ** 3,
+      survivor.physicalRadius = Math.cbrt(
+        survivor.physicalRadius ** 3 + other.physicalRadius ** 3,
       );
+      survivor.collisionRadius = this.arcadeCollisions
+        ? Math.cbrt(survivor.collisionRadius ** 3 + other.collisionRadius ** 3)
+        : survivor.physicalRadius;
+      survivor.renderRadius = Math.cbrt(survivor.renderRadius ** 3 + other.renderRadius ** 3);
     }
     if (other.isStar && !survivor.isStar && other.mass > survivor.mass * 0.5) {
       survivor.isStar = true;
@@ -578,15 +742,18 @@ export class Engine {
     this.needAccel = true;
   }
 
-  /** Find body under world coordinate with tolerance (AU). */
-  bodyAt(wx: number, wy: number, tol: number): Body | undefined {
+  /**
+   * Picking uses a caller-supplied hit radius (typically the on-screen visual
+   * radius in AU), never physicalRadius. UI must pass visual scale.
+   */
+  bodyAt(wx: number, wy: number, hitRadiusAU: (b: Body) => number): Body | undefined {
     let best: Body | undefined;
     let bestD = Infinity;
     for (const b of this.bodies) {
       const dx = b.x - wx;
       const dy = b.y - wy;
-      const d = Math.sqrt(dx * dx + dy * dy);
-      const hit = Math.max(b.radius, tol);
+      const d = Math.hypot(dx, dy);
+      const hit = hitRadiusAU(b);
       if (d < hit && d < bestD) {
         best = b;
         bestD = d;
@@ -595,58 +762,80 @@ export class Engine {
     return best;
   }
 
-  /** Specific orbital energy of body relative to reference. Negative => bound. */
-  specificEnergy(b: Body, ref: Body): number {
+  specificEnergy(b: { x: number; y: number; z?: number; vx: number; vy: number; vz?: number; mass?: number }, ref: Body): number {
     const dx = b.x - ref.x;
     const dy = b.y - ref.y;
+    const dz = (b.z ?? 0) - ref.z;
     const dvx = b.vx - ref.vx;
     const dvy = b.vy - ref.vy;
-    const r = Math.sqrt(dx * dx + dy * dy);
-    return 0.5 * (dvx * dvx + dvy * dvy) - (this.G * (ref.mass + b.mass)) / Math.max(r, 1e-6);
+    const dvz = (b.vz ?? 0) - ref.vz;
+    const r = Math.hypot(dx, dy, dz);
+    const m = b.mass ?? 0;
+    return 0.5 * (dvx * dvx + dvy * dvy + dvz * dvz) - (this.G * (ref.mass + m)) / Math.max(r, 1e-6);
   }
 
-  /**
-   * Predict the trajectory of a hypothetical new body.
-   * Integrates a copy of the (massive) system plus the test body.
-   */
   predict(
-    spec: { x: number; y: number; vx: number; vy: number; mass: number },
+    spec: { x: number; y: number; z?: number; vx: number; vy: number; vz?: number; mass: number },
     steps = 700,
     stride = 3,
     dtMul = 4,
   ): number[] {
     const massive = this.bodies.length > 40
-      ? this.bodies.filter((b) => b.mass > 1e-8)
-      : this.bodies;
+      ? this.bodies.filter((b) => this.isMassive(b) && b.mass > 1e-8)
+      : this.bodies.filter((b) => this.isMassive(b));
     const n = massive.length + 1;
     const xs = new Float64Array(n);
     const ys = new Float64Array(n);
+    const zs = new Float64Array(n);
     const vxs = new Float64Array(n);
     const vys = new Float64Array(n);
+    const vzs = new Float64Array(n);
     const ms = new Float64Array(n);
     const fixed = new Uint8Array(n);
     const axs = new Float64Array(n);
     const ays = new Float64Array(n);
+    const azs = new Float64Array(n);
     massive.forEach((b, i) => {
-      xs[i] = b.x; ys[i] = b.y; vxs[i] = b.vx; vys[i] = b.vy; ms[i] = b.mass; fixed[i] = b.fixed ? 1 : 0;
+      xs[i] = b.x;
+      ys[i] = b.y;
+      zs[i] = b.z;
+      vxs[i] = b.vx;
+      vys[i] = b.vy;
+      vzs[i] = b.vz;
+      ms[i] = b.mass;
+      fixed[i] = b.fixed ? 1 : 0;
     });
     const t = n - 1;
-    xs[t] = spec.x; ys[t] = spec.y; vxs[t] = spec.vx; vys[t] = spec.vy; ms[t] = spec.mass;
+    xs[t] = spec.x;
+    ys[t] = spec.y;
+    zs[t] = spec.z ?? 0;
+    vxs[t] = spec.vx;
+    vys[t] = spec.vy;
+    vzs[t] = spec.vz ?? 0;
+    ms[t] = spec.mass;
 
     const G = this.G;
     const eps2 = this.softening * this.softening;
     const dt = this.dt * dtMul;
     const half = dt / 2;
     const accel = () => {
-      axs.fill(0); ays.fill(0);
+      axs.fill(0);
+      ays.fill(0);
+      azs.fill(0);
       for (let i = 0; i < n; i++) {
         for (let j = i + 1; j < n; j++) {
           const dx = xs[j] - xs[i];
           const dy = ys[j] - ys[i];
-          const r2 = dx * dx + dy * dy + eps2;
+          const dz = zs[j] - zs[i];
+          const r2 = dx * dx + dy * dy + dz * dz + eps2;
           const inv = 1 / (r2 * Math.sqrt(r2));
-          axs[i] += G * ms[j] * dx * inv; ays[i] += G * ms[j] * dy * inv;
-          axs[j] -= G * ms[i] * dx * inv; ays[j] -= G * ms[i] * dy * inv;
+          const f = G * inv;
+          axs[i] += f * ms[j] * dx;
+          ays[i] += f * ms[j] * dy;
+          azs[i] += f * ms[j] * dz;
+          axs[j] -= f * ms[i] * dx;
+          ays[j] -= f * ms[i] * dy;
+          azs[j] -= f * ms[i] * dz;
         }
       }
     };
@@ -655,21 +844,30 @@ export class Engine {
     for (let s = 1; s <= steps; s++) {
       for (let i = 0; i < n; i++) {
         if (fixed[i]) continue;
-        vxs[i] += axs[i] * half; vys[i] += ays[i] * half;
-        xs[i] += vxs[i] * dt; ys[i] += vys[i] * dt;
+        vxs[i] += axs[i] * half;
+        vys[i] += ays[i] * half;
+        vzs[i] += azs[i] * half;
+        xs[i] += vxs[i] * dt;
+        ys[i] += vys[i] * dt;
+        zs[i] += vzs[i] * dt;
       }
       accel();
       for (let i = 0; i < n; i++) {
         if (fixed[i]) continue;
-        vxs[i] += axs[i] * half; vys[i] += ays[i] * half;
+        vxs[i] += axs[i] * half;
+        vys[i] += ays[i] * half;
+        vzs[i] += azs[i] * half;
       }
-      // stop if test body hits a massive body
       let hit = false;
       for (let i = 0; i < t; i++) {
         const dx = xs[t] - xs[i];
         const dy = ys[t] - ys[i];
-        const r = massive[i].radius;
-        if (dx * dx + dy * dy < r * r) { hit = true; break; }
+        const dz = zs[t] - zs[i];
+        const r = massive[i].collisionRadius;
+        if (dx * dx + dy * dy + dz * dz < r * r) {
+          hit = true;
+          break;
+        }
       }
       if (s % stride === 0) out.push(xs[t], ys[t]);
       if (hit) break;

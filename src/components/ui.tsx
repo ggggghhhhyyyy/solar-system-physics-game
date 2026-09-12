@@ -100,3 +100,11 @@ export function formatTime(years: number): string {
   const d = Math.floor((years - y) * 365.25);
   return `第 ${y} 年 第 ${d} 天`;
 }
+
+export function formatSimClock(epoch: string | null, years: number, date: Date | null, timeScale: 'TDB' | 'UTC' = 'UTC'): string {
+  if (epoch && date) {
+    const iso = date.toISOString().replace('T', ' ').slice(0, 16);
+    return `SIM DATE  ${iso} ${timeScale}`;
+  }
+  return `T + ${years.toFixed(3)} years`;
+}

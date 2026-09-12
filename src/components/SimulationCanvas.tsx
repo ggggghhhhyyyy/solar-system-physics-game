@@ -6,10 +6,14 @@ import {
   useRef,
 } from 'react';
 import type { Engine } from '../physics/engine';
-import { TRAIL_MAX } from '../physics/engine';
+import { TRAIL_MAX } from '../physics/constants';
 import type { Body } from '../physics/types';
 import { LAUNCH_TYPES } from '../physics/presets';
 import { AU_PER_YEAR_TO_KMS, LAUNCH_SCALE, type Settings } from '../game/settings';
+import { screenRadiusAU, screenRadiusPx } from '../rendering/visualScale';
+import { calculateLagrangePoints } from '../physics/orbital/lagrange';
+import { scientificProperties } from '../physics/orbital/spheres';
+import { rocheLimitAU } from '../physics/orbital/roche';
 
 export interface CanvasHandle {
   setView: (center: { x: number; y: number }, radius: number) => void;
@@ -144,7 +148,7 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
       vx += follow.vx;
       vy += follow.vy;
     }
-    return { vx, vy, relSpeed: Math.hypot(vx - (follow?.vx ?? 0), vy - (follow?.vy ?? 0)) };
+    return { vx, vy, vz: follow?.vz ?? 0, relSpeed: Math.hypot(vx - (follow?.vx ?? 0), vy - (follow?.vy ?? 0)) };
   }, [engine]);
 
   /* ---------------- Resize ---------------- */
@@ -280,50 +284,42 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
       const sel = s.selectedId != null ? engine.getBody(s.selectedId) : undefined;
       const ref = engine.heaviest();
       if (sel && ref && sel !== ref) {
-        const E = engine.specificEnergy(sel, ref);
-        // 双曲线(E>=0)不画椭圆
-        if (E < 0) {
+        const el = engine.orbitalElements(sel, ref);
+        if (!el.unbound && el.a != null && el.a > 0 && el.a < 1e6 && el.e < 0.999) {
           const rx = sel.x - ref.x;
           const ry = sel.y - ref.y;
           const rvx = sel.vx - ref.vx;
           const rvy = sel.vy - ref.vy;
-          const r = Math.hypot(rx, ry);
           const mu = engine.G * (ref.mass + sel.mass);
-          if (r > 1e-9 && mu > 0 && Number.isFinite(E)) {
-            const h = rx * rvy - ry * rvx;
-            const a = -mu / (2 * E);
-            let e = Math.sqrt(Math.max(0, 1 + (2 * E * h * h) / (mu * mu)));
-            if (!Number.isFinite(e)) e = 0;
-            e = Math.max(0, Math.min(e, 0.999));
-            if (Number.isFinite(a) && a > 0 && a < 1e6) {
-              // 偏心率矢量求近心点方向: e_vec=((v²-mu/r)*r_vec-(r·v)*v_vec)/mu,用相对量
-              const v2 = rvx * rvx + rvy * rvy;
-              const rSafe = Math.max(r, 1e-9);
-              const rdotv = rx * rvx + ry * rvy;
-              const ex = ((v2 - mu / rSafe) * rx - rdotv * rvx) / mu;
-              const ey = ((v2 - mu / rSafe) * ry - rdotv * rvy) / mu;
-              let omega = Math.atan2(ey, ex);
-              if (!Number.isFinite(omega) || Math.hypot(ex, ey) < 1e-8) omega = 0; // 圆轨道方向任意
-              const cosO = Math.cos(omega);
-              const sinO = Math.sin(omega);
-              const p = a * (1 - e * e);
-              ctx.strokeStyle = 'rgba(103, 232, 249, 0.4)';
-              ctx.lineWidth = 1;
-              ctx.beginPath();
-              const SEG = 128;
-              for (let k = 0; k <= SEG; k++) {
-                const nu = (k / SEG) * Math.PI * 2;
-                const rr = p / Math.max(1e-9, 1 + e * Math.cos(nu));
-                const ox = rr * Math.cos(nu);
-                const oy = rr * Math.sin(nu);
-                const wx = ref.x + ox * cosO - oy * sinO;
-                const wy = ref.y + ox * sinO + oy * cosO;
-                const [sx, sy] = toScreen(wx, wy);
-                if (k === 0) ctx.moveTo(sx, sy);
-                else ctx.lineTo(sx, sy);
-              }
-              ctx.stroke();
+          const r = Math.hypot(rx, ry);
+          if (r > 1e-9 && mu > 0) {
+            const v2 = rvx * rvx + rvy * rvy;
+            const rdotv = rx * rvx + ry * rvy;
+            const ex = ((v2 - mu / r) * rx - rdotv * rvx) / mu;
+            const ey = ((v2 - mu / r) * ry - rdotv * rvy) / mu;
+            let omega = Math.atan2(ey, ex);
+            if (!Number.isFinite(omega) || Math.hypot(ex, ey) < 1e-8) omega = 0;
+            const cosO = Math.cos(omega);
+            const sinO = Math.sin(omega);
+            const e = el.e;
+            const a = el.a;
+            const p = a * (1 - e * e);
+            ctx.strokeStyle = 'rgba(103, 232, 249, 0.4)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            const SEG = 128;
+            for (let k = 0; k <= SEG; k++) {
+              const nu = (k / SEG) * Math.PI * 2;
+              const rr = p / Math.max(1e-9, 1 + e * Math.cos(nu));
+              const ox = rr * Math.cos(nu);
+              const oy = rr * Math.sin(nu);
+              const wx = ref.x + ox * cosO - oy * sinO;
+              const wy = ref.y + ox * sinO + oy * cosO;
+              const [sx, sy] = toScreen(wx, wy);
+              if (k === 0) ctx.moveTo(sx, sy);
+              else ctx.lineTo(sx, sy);
             }
+            ctx.stroke();
           }
         }
       }
@@ -367,8 +363,7 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
     // bodies
     for (const b of bodies) {
       const [sx, sy] = toScreen(b.x, b.y);
-      const minPx = b.isBlackHole || b.isStar ? 7 : b.mass > 1e-5 ? 4.5 : 3;
-      const pr = Math.max(minPx, b.radius * cam.zoom);
+      const pr = screenRadiusPx(b, cam.zoom, s.uiMode);
       const margin = b.isBlackHole || b.isStar ? pr * 6 : pr + 40;
       if (sx < -margin || sx > w + margin || sy < -margin || sy > h + margin) continue;
       const [r, g, bl] = rgb(b.color);
@@ -508,54 +503,82 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
       }
     }
 
-    // 拉格朗日点 L1~L5(质量前二 M1>M2,仅 showLabels 时)
-    if (s.showLabels && bodies.length >= 2) {
-      let m1: Body | undefined;
-      let m2: Body | undefined;
-      for (const b of bodies) {
-        if (!m1 || b.mass > m1.mass) {
-          m2 = m1;
-          m1 = b;
-        } else if (!m2 || b.mass > m2.mass) {
-          m2 = b;
+    // Hill sphere / SOI overlays. VISUALIZATION ONLY — not physics.
+    {
+      const sel = s.selectedId != null ? engine.getBody(s.selectedId) : undefined;
+      const parent = engine.heaviest();
+      if (sel && parent && sel !== parent) {
+        const props = scientificProperties(sel, parent, engine.G);
+        const drawRing = (radiusAU: number | null, color: string, dash: number[]) => {
+          if (radiusAU == null || !(radiusAU > 0)) return;
+          const [hx, hy] = toScreen(sel.x, sel.y);
+          const rr = radiusAU * cam.zoom;
+          if (rr < 4 || rr > Math.max(w, h) * 4) return;
+          ctx.save();
+          ctx.setLineDash(dash);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(hx, hy, rr, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        };
+        if (s.showHillSphere) drawRing(props.hillSphere, 'rgba(52, 211, 153, 0.75)', [5, 4]);
+        if (s.showSOI) drawRing(props.sphereOfInfluence, 'rgba(167, 139, 250, 0.75)', [2, 4]);
+        if (s.showRoche) {
+          const d = rocheLimitAU(parent, sel, 'fluid');
+          if (d != null && d > 0) {
+            const [px, py] = toScreen(parent.x, parent.y);
+            const rr = d * cam.zoom;
+            if (rr >= 4 && rr <= Math.max(w, h) * 4) {
+              ctx.save();
+              ctx.setLineDash([3, 5]);
+              ctx.strokeStyle = 'rgba(251, 113, 133, 0.8)';
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.arc(px, py, rr, 0, Math.PI * 2);
+              ctx.stroke();
+              ctx.restore();
+            }
+          }
+        }
+      }
+    }
+
+    // Lagrange L1–L5 via CRTBP solver (not Hill-radius approximation).
+    // VISUALIZATION ONLY. Toggle-controlled. Selected body becomes the secondary
+    // when it is a valid CRTBP companion; otherwise the two heaviest bodies.
+    if (s.showLagrange && bodies.length >= 2) {
+      const sel = s.selectedId != null ? engine.getBody(s.selectedId) : undefined;
+      let m1: Body | undefined = engine.heaviest();
+      let m2: Body | undefined = sel && sel !== m1 ? sel : undefined;
+      if (!m2) {
+        for (const b of bodies) {
+          if (b === m1) continue;
+          if (!m2 || b.mass > m2.mass) m2 = b;
         }
       }
       if (m1 && m2 && m2.mass > 0 && m1.mass / m2.mass > 20) {
-        const dx = m2.x - m1.x;
-        const dy = m2.y - m1.y;
-        const dd = Math.hypot(dx, dy);
-        if (dd > 1e-6) {
-          const ux = dx / dd;
-          const uy = dy / dd;
-          const rH = dd * Math.cbrt(m2.mass / (3 * m1.mass)); // Hill 半径
-          // L1/L2: 连线上距 M2 ±rH(近似); L3: M1 外侧反方向近似,非精确解
-          const q = 1 + (7 * m2.mass) / (12 * m1.mass); // L3 近似系数
-          const pts: Array<[number, number, string]> = [
-            [m2.x - ux * rH, m2.y - uy * rH, 'L1'],
-            [m2.x + ux * rH, m2.y + uy * rH, 'L2'],
-            [m1.x - ux * dd * q, m1.y - uy * dd * q, 'L3'],
-          ];
-          // L4/L5: 等边三角形精确解
-          const mx = (m1.x + m2.x) / 2;
-          const my = (m1.y + m2.y) / 2;
-          const hx = -uy * dd * (Math.sqrt(3) / 2);
-          const hy = ux * dd * (Math.sqrt(3) / 2);
-          pts.push([mx + hx, my + hy, 'L4'], [mx - hx, my - hy, 'L5']);
-          // 共线虚线 L3—M1—M2—L2,衬托拉格朗日点位置关系
-          const [l3x, l3y] = toScreen(pts[2][0], pts[2][1]);
-          const [l2x, l2y] = toScreen(pts[1][0], pts[1][1]);
-          ctx.strokeStyle = 'rgba(251, 191, 36, 0.18)';
-          ctx.lineWidth = 1;
-          ctx.setLineDash([4, 5]);
-          ctx.beginPath();
-          ctx.moveTo(l3x, l3y);
-          ctx.lineTo(l2x, l2y);
-          ctx.stroke();
-          ctx.setLineDash([]);
+        const pts = calculateLagrangePoints(m1, m2);
+        if (pts) {
+          const l3 = pts.find((p) => p.id === 'L3');
+          const l2 = pts.find((p) => p.id === 'L2');
+          if (l3 && l2) {
+            const [l3x, l3y] = toScreen(l3.x, l3.y);
+            const [l2x, l2y] = toScreen(l2.x, l2.y);
+            ctx.strokeStyle = 'rgba(251, 191, 36, 0.18)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 5]);
+            ctx.beginPath();
+            ctx.moveTo(l3x, l3y);
+            ctx.lineTo(l2x, l2y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
           ctx.font = '600 10px ui-sans-serif, system-ui, sans-serif';
           ctx.textAlign = 'left';
-          for (const [wx, wy, label] of pts) {
-            const [sx, sy] = toScreen(wx, wy);
+          for (const p of pts) {
+            const [sx, sy] = toScreen(p.x, p.y);
             if (sx < -20 || sx > w + 20 || sy < -20 || sy > h + 20) continue;
             const R = 5;
             ctx.beginPath();
@@ -569,12 +592,11 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
             ctx.strokeStyle = 'rgba(255, 240, 200, 0.9)';
             ctx.lineWidth = 1;
             ctx.stroke();
-            // 深色描边衬底,保证文字在亮星附近也清晰
             ctx.lineWidth = 3;
             ctx.strokeStyle = 'rgba(2, 3, 10, 0.9)';
-            ctx.strokeText(label, sx + 8, sy + 4);
+            ctx.strokeText(p.id, sx + 8, sy + 4);
             ctx.fillStyle = 'rgba(253, 230, 170, 0.95)';
-            ctx.fillText(label, sx + 8, sy + 4);
+            ctx.fillText(p.id, sx + 8, sy + 4);
           }
         }
       }
@@ -584,7 +606,7 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
     if (d && d.mode === 'launch') {
       const lt = LAUNCH_TYPES.find((l) => l.id === s.launchTypeId) ?? LAUNCH_TYPES[0];
       const [gx, gy] = toScreen(d.startWorld.x, d.startWorld.y);
-      const pr = Math.max(lt.isStar || lt.isBlackHole ? 7 : 4, lt.radius * cam.zoom);
+      const pr = Math.max(lt.isStar || lt.isBlackHole ? 7 : 4, lt.renderRadius * cam.zoom);
       if (lt.isBlackHole) {
         ctx.fillStyle = '#000000';
         ctx.beginPath();
@@ -766,25 +788,31 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
     if (!d.moved) {
       // click -> select
       const wpt = toWorld(d.startX, d.startY);
-      const hit = engine.bodyAt(wpt.x, wpt.y, 10 / camRef.current.zoom);
+      const hit = engine.bodyAt(wpt.x, wpt.y, (b) =>
+        Math.max(screenRadiusAU(b, camRef.current.zoom, settingsRef.current.uiMode), 10 / camRef.current.zoom),
+      );
       callbacksRef.current.onSelect(hit ? hit.id : null);
       return;
     }
     if (d.mode === 'launch') {
       const lt = LAUNCH_TYPES.find((l) => l.id === s.launchTypeId) ?? LAUNCH_TYPES[0];
-      const { vx, vy } = launchVelocity(d);
+      const { vx, vy, vz } = launchVelocity(d);
       const count = engine.bodies.filter((b) => b.userLaunched).length + 1;
       const body = engine.addBody({
         name: `${lt.name}-${count}`,
         mass: lt.mass,
-        radius: lt.radius,
+        physicalRadius: lt.physicalRadius,
+        renderRadius: lt.renderRadius,
         color: lt.color,
         isStar: lt.isStar,
         isBlackHole: lt.isBlackHole,
+        gravityMode: lt.gravityMode,
         x: d.startWorld.x,
         y: d.startWorld.y,
+        z: 0,
         vx,
         vy,
+        vz,
         userLaunched: true,
       });
       callbacksRef.current.onLaunch(body);
@@ -809,7 +837,9 @@ const SimulationCanvas = forwardRef<CanvasHandle, Props>(function SimulationCanv
   const onDoubleClick = (e: React.MouseEvent) => {
     const rect = canvasRef.current!.getBoundingClientRect();
     const wpt = toWorld(e.clientX - rect.left, e.clientY - rect.top);
-    const hit = engine.bodyAt(wpt.x, wpt.y, 10 / camRef.current.zoom);
+    const hit = engine.bodyAt(wpt.x, wpt.y, (b) =>
+      Math.max(screenRadiusAU(b, camRef.current.zoom, settingsRef.current.uiMode), 10 / camRef.current.zoom),
+    );
     if (hit) {
       callbacksRef.current.onSelect(hit.id);
       callbacksRef.current.onFollow(hit.id);

@@ -1,8 +1,31 @@
 import { LAUNCH_TYPES, PRESETS } from '../physics/presets';
 import type { Settings } from '../game/settings';
 import type { MissionState } from '../game/missions';
+import type { ReferenceFrameKind, UiMode } from '../physics/types';
+import type { EphemerisSource, TimeScale } from '../physics/ephemeris/types';
 import { Btn, Panel, SectionTitle, Toggle } from './ui';
 import { cn } from '../utils/cn';
+
+export const EPOCH_CHIPS: Array<{ label: string; date: string }> = [
+  { label: 'DE441 缓存', date: '2026-09-11' },
+  { label: 'J2000', date: '2000-01-01' },
+  { label: '阿波罗 11', date: '1969-07-20' },
+  { label: 'Voyager 2 海王星', date: '1989-08-25' },
+  { label: '新视野号冥王星', date: '2015-07-14' },
+  { label: '帕克近日点', date: '2024-12-24' },
+];
+
+export interface EphemerisMeta {
+  source: EphemerisSource;
+  timeScale: TimeScale;
+  label: string;
+}
+
+export function describeEphemerisSource(source: EphemerisSource): string {
+  if (source === 'horizons-cache') return 'JPL Horizons DE441 缓存';
+  if (source === 'horizons-live') return 'JPL Horizons 实时';
+  return 'JPL 开普勒近似';
+}
 
 interface Props {
   settings: Settings;
@@ -24,6 +47,15 @@ interface Props {
   dailyDate?: string;
   rerollsLeft?: number;
   onReroll?: () => void;
+  epochDate: string;
+  onEpochDate: (v: string) => void;
+  includeSpacecraft: boolean;
+  onIncludeSpacecraft: (v: boolean) => void;
+  includeMoons: boolean;
+  onIncludeMoons: (v: boolean) => void;
+  ephemerisLoading: boolean;
+  ephemerisMeta: EphemerisMeta | null;
+  onLoadEphemeris: (source: 'horizons' | 'keplerian') => void;
 }
 
 export default function ControlPanel({
@@ -46,6 +78,15 @@ export default function ControlPanel({
   dailyDate,
   rerollsLeft = 0,
   onReroll,
+  epochDate,
+  onEpochDate,
+  includeSpacecraft,
+  onIncludeSpacecraft,
+  includeMoons,
+  onIncludeMoons,
+  ephemerisLoading,
+  ephemerisMeta,
+  onLoadEphemeris,
 }: Props) {
   const doneCount = missions.filter((m) => m.done).length;
   const achList = achievements ?? [];
@@ -105,6 +146,72 @@ export default function ControlPanel({
           </div>
         </section>
 
+        <section>
+          <SectionTitle>NASA / JPL</SectionTitle>
+          <p className="mb-2 text-[10px] leading-relaxed text-slate-400">
+            真实历元的笛卡尔状态矢量。物理引擎只吃归一化状态，不知道 NASA 是谁。
+          </p>
+          <label className="mb-1.5 block text-[10px] text-slate-400">
+            历元（按 TDB 日历日）
+            <input
+              type="date"
+              value={epochDate}
+              onChange={(e) => onEpochDate(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 font-mono text-xs text-slate-100 outline-none caret-transparent focus:border-cyan-400/50"
+            />
+          </label>
+          <div className="mb-2 flex flex-wrap gap-1">
+            {EPOCH_CHIPS.map((c) => (
+              <button
+                key={`${c.date}-${c.label}`}
+                type="button"
+                onClick={() => onEpochDate(c.date)}
+                className={cn(
+                  'rounded-md border px-2 py-1 text-[10px] transition-colors',
+                  epochDate === c.date
+                    ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-100'
+                    : 'border-white/10 bg-white/5 text-slate-300 hover:bg-white/10',
+                )}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+          <Toggle
+            label="航天器（test particle）"
+            checked={includeSpacecraft}
+            onChange={onIncludeSpacecraft}
+          />
+          <Toggle
+            label="主要卫星（伊奥/泰坦/卡戎…）"
+            checked={includeMoons}
+            onChange={onIncludeMoons}
+          />
+          <div className="mt-2 grid grid-cols-2 gap-1.5">
+            <Btn
+              disabled={ephemerisLoading}
+              onClick={() => onLoadEphemeris('horizons')}
+              className="border-amber-400/40 bg-amber-500/10 text-amber-100 hover:bg-amber-500/20"
+            >
+              {ephemerisLoading ? '查询中…' : 'Horizons'}
+            </Btn>
+            <Btn disabled={ephemerisLoading} onClick={() => onLoadEphemeris('keplerian')}>
+              开普勒近似
+            </Btn>
+          </div>
+          {ephemerisMeta && (
+            <div className="mt-2 rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-[10px] leading-relaxed text-slate-300">
+              <div className="font-mono text-cyan-200">
+                {describeEphemerisSource(ephemerisMeta.source)} · {ephemerisMeta.timeScale}
+              </div>
+              <div className="mt-0.5 text-slate-400">{ephemerisMeta.label}</div>
+            </div>
+          )}
+          <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
+            2026-09-11 走烘焙 DE441 缓存，瞬间加载。其它历元请求 JPL Horizons；失败则回落到两体开普勒近似（无月球、无探测器）。卫星距离是真值：跟随木星并放大才能分开伽利略四卫。
+          </p>
+        </section>
+
         {/* Tool */}
         <section>
           <SectionTitle>工具</SectionTitle>
@@ -162,7 +269,7 @@ export default function ControlPanel({
             step={0.01}
             value={Math.log10(gMultiplier)}
             onChange={(e) => onGChange(Math.pow(10, parseFloat(e.target.value)))}
-            className="w-full accent-cyan-400"
+            className="w-full accent-cyan-400 caret-transparent"
           />
           <div className="mt-1 flex gap-1.5">
             {[0.5, 1, 2].map((v) => (
@@ -176,7 +283,45 @@ export default function ControlPanel({
             <Toggle label="显示轨迹" checked={settings.showTrails} onChange={(v) => update({ showTrails: v })} />
             <Toggle label="显示名称" checked={settings.showLabels} onChange={(v) => update({ showLabels: v })} />
             <Toggle label="发射轨迹预测" checked={settings.showPrediction} onChange={(v) => update({ showPrediction: v })} />
+            <Toggle label="Hill Sphere" checked={settings.showHillSphere} onChange={(v) => update({ showHillSphere: v })} />
+            <Toggle label="Sphere of Influence" checked={settings.showSOI} onChange={(v) => update({ showSOI: v })} />
+            <Toggle label="Lagrange L1–L5" checked={settings.showLagrange} onChange={(v) => update({ showLagrange: v })} />
+            <Toggle label="Roche / TDE" checked={settings.showRoche} onChange={(v) => update({ showRoche: v })} />
+            <Toggle label="自适应 dt（交会加密）" checked={settings.adaptiveDt} onChange={(v) => update({ adaptiveDt: v })} />
           </div>
+        </section>
+
+        <section>
+          <SectionTitle>模式</SectionTitle>
+          <div className="mb-2 grid grid-cols-2 gap-1.5">
+            <Btn active={settings.uiMode === 'game'} onClick={() => update({ uiMode: 'game' as UiMode })}>
+              GAME
+            </Btn>
+            <Btn active={settings.uiMode === 'science'} onClick={() => update({ uiMode: 'science' as UiMode })}>
+              SCIENCE
+            </Btn>
+          </div>
+          {settings.uiMode === 'science' && (
+            <div className="grid grid-cols-3 gap-1.5">
+              {([
+                ['barycentric', '质心'],
+                ['heliocentric', '日心'],
+                ['body-centric', '选中'],
+              ] as Array<[ReferenceFrameKind, string]>).map(([id, label]) => (
+                <Btn
+                  key={id}
+                  active={settings.referenceFrame === id}
+                  onClick={() => update({ referenceFrame: id })}
+                  className="px-1 text-[10px]"
+                >
+                  {label}
+                </Btn>
+              ))}
+            </div>
+          )}
+          <p className="mt-2 text-[10px] leading-relaxed text-slate-400">
+            GAME 保持沙盒体验。SCIENCE 显示状态矢量、六根数、守恒量与 Hill/SOI。两者共用同一物理引擎。
+          </p>
         </section>
 
         {/* Events */}
